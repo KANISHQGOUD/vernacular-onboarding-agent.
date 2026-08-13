@@ -1,0 +1,20 @@
+# Secrets — never commit these
+.env
+*.key
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Audio scratch files (from A5/A6 onward)
+*.wav
+*.mp3
+recordings/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
