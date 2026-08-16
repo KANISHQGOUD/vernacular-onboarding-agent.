@@ -139,6 +139,67 @@ def run_scripted() -> None:
     summarise(session, audit)
 
 
+# A fixed conversation, replayed against the real model. Hindi and Hinglish
+# input, but the agent answers in English on purpose: phrasing in English costs
+# no API calls, so the whole per-minute budget goes to real classification --
+# which is the part that cannot be cached and the part worth verifying.
+AUTO_SCRIPT: list[str] = [
+    "english theek rahega",
+    "haan ji, mujhe koi dikkat nahi hai",
+    "mera naam Asha Devi hai",
+    "main ek janvari unnees sau nabbe ko paida hui thi",
+    "main Nashik mein Gandhi Road par rehti hoon, makaan number chaudah",
+    "main darzi ka kaam karti hoon",
+]
+
+
+def run_auto(pace: float) -> None:
+    """Replay AUTO_SCRIPT against the live model, paced under the rate limit."""
+    if not api_key_available():
+        print("GOOGLE_API_KEY is empty. Use --scripted, or add a key to .env.")
+        raise SystemExit(1)
+
+    conversation, audit = build(scripted=False)
+    session = Session(session_id="demo")
+
+    print(f"\n{BOLD}Live run -- real classification on every turn.{RESET}")
+    print(f"{DIM}pacing {pace:.0f}s between turns to stay under the free-tier limit{RESET}\n")
+
+    show(conversation.open(session), State.START)
+
+    timings: list[float] = []
+    for index, utterance in enumerate(AUTO_SCRIPT):
+        before = session.state
+        print(f"  {DIM}caller:{RESET} {utterance}")
+
+        started = time.perf_counter()
+        reply = conversation.respond(session, utterance)
+        elapsed = (time.perf_counter() - started) * 1000
+        timings.append(elapsed)
+        show(reply, before, elapsed)
+
+        if session.state in {State.COMPLETED, State.DECLINED, State.HUMAN_HANDOFF}:
+            break
+        if index < len(AUTO_SCRIPT) - 1:
+            time.sleep(pace)
+
+    if session.state is State.KYC_PENDING:
+        print(f"{DIM}  --- applicant leaves for the video call, session stored ---{RESET}")
+        store = InMemorySessionStore()
+        store.save(session)
+        session = store.load(session.session_id)
+        print(f"{DIM}  --- hours later: reloaded, resuming (no model call) ---{RESET}\n")
+        before = session.state
+        show(conversation.resume(session), before)
+
+    if timings:
+        ordered = sorted(timings)
+        print(f"{BOLD}turn latency:{RESET} median {ordered[len(ordered) // 2]:.0f}ms, "
+              f"min {ordered[0]:.0f}ms, max {ordered[-1]:.0f}ms")
+    print(f"{BOLD}phrasing:{RESET}    {conversation.phraser.stats()}")
+    summarise(session, audit)
+
+
 def run_interactive() -> None:
     if not api_key_available():
         print("GOOGLE_API_KEY is empty. Use --scripted, or add a key to .env.")
@@ -177,6 +238,10 @@ def summarise(session: Session, audit: InMemoryAuditSink) -> None:
 
     print(f"{BOLD}final state:{RESET} {session.state}")
     print(f"{BOLD}language:{RESET}    {session.language or DEFAULT_LANGUAGE}")
+    if session.applicant:
+        print(f"{BOLD}collected:{RESET}")
+        for name in sorted(session.applicant):
+            print(f"    {name:16} {session.applicant[name]}")
     if session.account_number:
         print(f"{BOLD}account:{RESET}     {session.account_number}")
     print(f"{BOLD}audit:{RESET}       {len(trail)} records, {len(moves)} moves, {len(refusals)} refused")
@@ -189,6 +254,13 @@ if __name__ == "__main__":
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scripted", action="store_true", help="run without an API key")
+    parser.add_argument("--auto", action="store_true", help="replay a fixed conversation live")
+    parser.add_argument("--pace", type=float, default=13.0, help="seconds between live turns")
     args = parser.parse_args()
 
-    run_scripted() if args.scripted else run_interactive()
+    if args.scripted:
+        run_scripted()
+    elif args.auto:
+        run_auto(args.pace)
+    else:
+        run_interactive()

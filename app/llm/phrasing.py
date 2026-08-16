@@ -4,11 +4,12 @@ The machine has already chosen WHAT to say. This file only chooses HOW, and
 in which language. It cannot introduce a subject the machine did not pick,
 because a `SpeechAct` is the only input it accepts.
 
-BUILT AROUND 5 REQUESTS PER MINUTE
-----------------------------------
-The free tier allows 5 model calls a minute. Two calls per conversational turn
-would cap this agent at 2.5 turns a minute -- not a conversation. So phrasing
-avoids the model wherever it honestly can:
+BUILT AROUND A VERY SMALL BUDGET
+--------------------------------
+The free tier allows 5 model calls a minute and 20 a day (see client.py for
+the measured figures). Twenty a day is about three complete conversations, so
+every avoidable call is a meaningful fraction of the budget. Phrasing
+therefore avoids the model wherever it honestly can:
 
   1. English needs no call at all. The fallback sentences ARE English, written
      by a human, and already correct. A model call to rewrite correct English

@@ -28,21 +28,33 @@ MEASURED AGAINST THE LIVE FREE TIER, 2026-08-15
 -----------------------------------------------
     gemini-2.5-flash      DEAD -- "no longer available"
     gemini-3.7-flash      exists, but free-tier quota rejects it
-    gemini-3.5-flash      works. all thinking levels. ~1.0-1.4s per call
-    free tier limit       5 requests per minute, per model
-    enum mode             works, and classified Hindi correctly
+    gemini-3.5-flash      works. all thinking levels.
+    latency               ~3.1-4.6s per classification, measured over a
+                          full conversation. Earlier lower figures were taken
+                          during a quiet period and did not hold up.
 
-That 5 RPM ceiling is the constraint the whole design bends around. Two model
-calls per conversational turn would cap the agent at 2.5 turns a minute, which
-is not a conversation. So:
+    QUOTA -- two separate ceilings, and the second one is the real constraint:
+      GenerateRequestsPerMinutePerProjectPerModel-FreeTier   5 per minute
+      GenerateRequestsPerDayPerProjectPerModel-FreeTier     20 per DAY
 
-  - classification calls the model, because it genuinely cannot be cached
+Twenty a day is roughly three complete conversations. Not a development
+budget, and worth knowing before planning around it. Both quotas are scoped
+per project PER MODEL, so switching GEMINI_MODEL moves to a fresh bucket --
+which is the practical reason that setting is an environment variable rather
+than a constant.
+
+Those ceilings are why the design spends calls the way it does:
+
+  - classification calls the model, because it genuinely cannot be cached --
+    every caller says something new
   - phrasing mostly does NOT, because the same speech act in the same language
-    is the same sentence every time (see phrasing.py)
+    is the same sentence every time (see phrasing.py). Measured over a full
+    live conversation in English: eight speech acts, zero calls.
 
-A 429 is therefore expected traffic on this tier, not an exception. It is
-caught and degraded like any other failure -- never retried mid-call, because
-the retry-after is measured in tens of seconds and there is a person waiting.
+A 429 is therefore expected traffic on this tier, not an exception -- and it
+has been observed in anger, alongside 503s. Both are caught and degraded like
+any other failure, and never retried mid-call, because the retry-after is
+measured in tens of seconds and there is a person waiting.
 
 DEGRADING, NOT CRASHING
 -----------------------

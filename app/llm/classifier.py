@@ -94,10 +94,13 @@ INTENT_GLOSS: dict[Event, str] = {
 }
 
 FIELD_GLOSS: dict[str, str] = {
-    "full_name": "the caller's own full name",
+    "full_name": "the caller's own full name, the name only",
     "date_of_birth": "the caller's date of birth, as YYYY-MM-DD if you can work it out",
-    "address": "where the caller lives",
-    "occupation": "what the caller does for a living",
+    # "just the place" earns its keep: without it, "main Nashik mein Gandhi
+    # Road par rehti hoon" came back as the whole clause, verb included, and
+    # an address field containing "I live in" is not an address.
+    "address": "where the caller lives -- just the place, not the words around it",
+    "occupation": "what the caller does for a living, the job only",
     "mobile": "the caller's mobile number, digits only",
 }
 
