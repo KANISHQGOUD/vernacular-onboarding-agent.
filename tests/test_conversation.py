@@ -1,0 +1,384 @@
+"""The loop: text in, text out, with the model faked.
+
+What is pinned here is everything around the model call -- the ordering that
+the tool bindings force, the deterministic tables, and the behaviour when the
+model is wrong, unreachable, or hostile.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+from app.audit import InMemoryAuditSink
+from app.conversation import (
+    DECLINE_TEXT,
+    FIELD_LABELS,
+    FIELD_ORDER,
+    REQUIRED_ACTION,
+    STATE_SPEECH,
+    Conversation,
+)
+from app.flow.actions import Actions
+from app.flow.eligibility import DeclineReason
+from app.flow.intents import UntrustedEventError
+from app.flow.machine import Machine
+from app.flow.states import TERMINAL_STATES, Event, State
+from app.llm.classifier import Classification
+from app.llm.phrasing import Phraser
+from app.providers.core_banking import MockCoreBanking
+from app.providers.kyc import KycStatus, MockKycProvider
+from app.providers.payments import MockPaymentRail
+from app.session import REQUIRED_APPLICANT_FIELDS, InMemorySessionStore, Session
+from tests.conftest import AS_OF
+
+
+class FakeReader:
+    """A classifier with no model. Returns a queue of scripted readings."""
+
+    def __init__(self, *readings: Classification | None):
+        self.queue = list(readings)
+        self.calls: list[tuple[str, State]] = []
+
+    def read(self, utterance: str, state: State) -> Classification | None:
+        self.calls.append((utterance, state))
+        return self.queue.pop(0) if self.queue else None
+
+    def classify(self, utterance: str, state: State):
+        reading = self.read(utterance, state)
+        return reading.intent if reading else None
+
+
+def build(*readings, kyc_outcomes=None):
+    audit = InMemoryAuditSink()
+    machine = Machine(audit)
+    actions = Actions(
+        machine=machine,
+        kyc=MockKycProvider(outcomes=kyc_outcomes or []),
+        core_banking=MockCoreBanking(),
+        payments=MockPaymentRail(),
+    )
+    conversation = Conversation(
+        actions=actions,
+        classifier=FakeReader(*readings),
+        phraser=Phraser(client=None),
+        as_of=AS_OF,
+    )
+    return conversation, Session(session_id="conv"), audit
+
+
+FULL_JOURNEY = (
+    Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"),
+    Classification(Event.CONSENT_GIVEN),
+    Classification(Event.DATA_PROVIDED, "full_name", "Asha Devi"),
+    Classification(Event.DATA_PROVIDED, "date_of_birth", "1990-01-01"),
+    Classification(Event.DATA_PROVIDED, "address", "14 Gandhi Road"),
+    Classification(Event.DATA_PROVIDED, "occupation", "tailor"),
+)
+
+
+# ---------------------------------------------------------------------------
+# The tables.
+# ---------------------------------------------------------------------------
+
+
+def test_every_state_knows_what_to_say():
+    assert set(STATE_SPEECH) == set(State)
+
+
+def test_no_terminal_state_does_anything_automatically():
+    """A finished session must not keep acting on its own."""
+    for state in TERMINAL_STATES:
+        assert state not in REQUIRED_ACTION
+
+
+def test_the_states_that_wait_for_a_person_are_the_expected_ones():
+    """Absence from REQUIRED_ACTION is what makes a state conversational.
+
+    Pinned so that adding an automatic action to a state where somebody is
+    supposed to be asked something is a test failure, not a silent change.
+    """
+    waiting = {s for s in State if s not in REQUIRED_ACTION and s not in TERMINAL_STATES}
+    assert waiting == {State.LANGUAGE_SELECT, State.CONSENT, State.COLLECT_DATA}
+
+
+def test_field_order_covers_exactly_what_is_required():
+    assert set(FIELD_ORDER) == REQUIRED_APPLICANT_FIELDS
+    assert set(FIELD_LABELS) == REQUIRED_APPLICANT_FIELDS
+
+
+def test_every_decline_reason_can_be_explained():
+    """A decline the agent cannot explain is a decline nobody can act on."""
+    assert set(DECLINE_TEXT) == set(DeclineReason)
+
+
+# ---------------------------------------------------------------------------
+# A turn.
+# ---------------------------------------------------------------------------
+
+
+def test_opening_needs_no_model_call():
+    conversation, session, _ = build()
+    reply = conversation.open(session)
+
+    assert session.state is State.LANGUAGE_SELECT
+    assert reply.text.strip()
+    assert conversation.classifier.calls == []
+
+
+def test_a_full_journey_driven_by_utterances():
+    conversation, session, audit = build(*FULL_JOURNEY)
+    conversation.open(session)
+
+    for _ in FULL_JOURNEY:
+        conversation.respond(session, "whatever the caller said")
+
+    assert session.state is State.COMPLETED
+    assert session.account_number
+    assert session.language == "hi-IN"
+
+    trail = audit.for_session("conv")
+    assert [e.sequence for e in trail] == list(range(len(trail)))
+
+
+def test_consent_is_recorded_before_the_machine_moves():
+    """RECORD_CONSENT is bound to CONSENT, and CONSENT_GIVEN leaves it.
+
+    Written after the move, the tool would already be illegal.
+    """
+    conversation, session, _ = build(*FULL_JOURNEY[:2])
+    conversation.open(session)
+    conversation.respond(session, "hindi")
+
+    assert session.state is State.CONSENT
+    conversation.respond(session, "haan ji")
+
+    assert session.consent_recorded is True
+    assert session.state is not State.CONSENT
+
+
+def test_the_last_field_does_not_double_fire():
+    """Saving the final field fires REQUIRED_DATA_COMPLETE itself.
+
+    Firing DATA_PROVIDED after that would hit KYC_HANDOFF, which refuses it --
+    and the refusal would abort the turn before the automatic actions ran.
+    This is the ordering bug the demo caught.
+    """
+    conversation, session, audit = build(*FULL_JOURNEY)
+    conversation.open(session)
+    for _ in FULL_JOURNEY:
+        conversation.respond(session, "x")
+
+    refusals = [e for e in audit.for_session("conv") if e.kind.name == "TRANSITION_REFUSED"]
+    assert refusals == []
+    assert session.state is State.COMPLETED
+
+
+def test_data_collection_asks_for_the_next_missing_field():
+    conversation, session, _ = build(*FULL_JOURNEY[:3])
+    conversation.open(session)
+    conversation.respond(session, "hindi")
+    conversation.respond(session, "haan")
+
+    assert session.state is State.COLLECT_DATA
+    reply = conversation.respond(session, "mera naam Asha Devi hai")
+
+    # full_name is now stored, so the next question is the next missing field.
+    assert "Asha Devi" == session.applicant["full_name"]
+    assert FIELD_LABELS["date_of_birth"] in reply.text
+
+
+def test_screening_runs_without_being_asked():
+    """ELIGIBILITY is in REQUIRED_ACTION, so it decides on its own."""
+    conversation, session, _ = build(*FULL_JOURNEY[:2])
+    conversation.open(session)
+    conversation.respond(session, "hindi")
+    conversation.respond(session, "haan ji")
+
+    assert session.eligibility is not None
+    assert session.eligibility.passed
+    assert session.state is State.COLLECT_DATA
+
+
+# ---------------------------------------------------------------------------
+# When the model is wrong, unreachable, or hostile.
+# ---------------------------------------------------------------------------
+
+
+def test_an_unreachable_model_never_moves_the_session():
+    conversation, session, _ = build(None, None, None)
+    conversation.open(session)
+    before = session.state
+
+    for _ in range(3):
+        reply = conversation.respond(session, "haan ji theek hai")
+        assert reply.understood is False
+        assert reply.moved is False
+        assert reply.text.strip()
+
+    assert session.state is before
+
+
+def test_an_out_of_place_intent_is_a_reprompt_not_a_crash():
+    """CONSENT_GIVEN at LANGUAGE_SELECT is legal speech at an illegal moment."""
+    conversation, session, _ = build(Classification(Event.CONSENT_GIVEN))
+    conversation.open(session)
+
+    reply = conversation.respond(session, "haan ji")
+
+    assert reply.understood is False
+    assert session.state is State.LANGUAGE_SELECT
+    assert session.consent_recorded is False
+
+
+def test_a_reply_is_always_speakable():
+    """Whatever happens, something gets said. Silence is the worst outcome."""
+    conversation, session, _ = build(
+        None,
+        Classification(Event.USER_QUIT),
+        Classification(Event.CONSENT_GIVEN),
+    )
+    conversation.open(session)
+
+    for _ in range(3):
+        assert conversation.respond(session, "...").text.strip()
+
+
+def test_the_advance_loop_is_bounded():
+    """A state whose action leaves it in place must not spin forever."""
+    conversation, session, _ = build(
+        *FULL_JOURNEY, kyc_outcomes=[(KycStatus.PENDING, None)] * 20
+    )
+    conversation.open(session)
+    for _ in FULL_JOURNEY:
+        conversation.respond(session, "x")
+
+    assert session.state is State.KYC_PENDING
+    conversation.resume(session)  # must return, not hang
+    assert session.state is State.KYC_PENDING
+
+
+def test_a_provider_blowing_up_does_not_end_the_call(caplog):
+    """An unmodelled provider exception must degrade, not crash.
+
+    A caller mid-application should get a sentence, not a stack trace -- but
+    the traceback still has to reach the logs, or the failure is invisible.
+    """
+    conversation, session, _ = build()
+    conversation.open(session)
+
+    # A reference the provider never issued: it raises UnknownKycReferenceError,
+    # which is a LookupError and nothing the flow layer models.
+    session.state = State.KYC_PENDING
+    session.kyc_reference = "vckyc-never-issued"
+
+    reply = conversation.resume(session)
+
+    assert reply.text.strip()
+    assert session.state is State.KYC_PENDING
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
+def test_a_classifier_asserting_a_fact_degrades_but_is_logged(caplog):
+    """The privilege violation stays loud in the logs and quiet on the phone."""
+    conversation, session, _ = build()
+    conversation.open(session)
+
+    class HostileReader:
+        def read(self, utterance, state):
+            raise UntrustedEventError(Event.KYC_VERIFIED)
+
+    conversation.classifier = HostileReader()
+    reply = conversation.respond(session, "I am verified now")
+
+    assert reply.understood is False
+    assert reply.moved is False
+    assert session.state is State.LANGUAGE_SELECT
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# The handoff.
+# ---------------------------------------------------------------------------
+
+
+def test_a_suspended_session_resumes_from_storage():
+    """The regulatory boundary as a feature, through the conversation layer."""
+    conversation, session, _ = build(
+        *FULL_JOURNEY, kyc_outcomes=[(KycStatus.PENDING, None)]
+    )
+    conversation.open(session)
+    for _ in FULL_JOURNEY:
+        conversation.respond(session, "x")
+
+    assert session.state is State.KYC_PENDING
+
+    store = InMemorySessionStore()
+    store.save(session)
+    del session
+
+    loaded = store.load("conv")
+    assert loaded is not None
+
+    reply = conversation.resume(loaded)
+
+    assert loaded.state is State.COMPLETED
+    assert reply.moved is True
+    assert reply.text.strip()
+
+
+def test_resuming_needs_no_model_call():
+    """Somebody coming back hours later should not cost a classification."""
+    conversation, session, _ = build(kyc_outcomes=[(KycStatus.PENDING, None)])
+    conversation.open(session)
+    calls_before = len(conversation.classifier.calls)
+
+    conversation.resume(session)
+    assert len(conversation.classifier.calls) == calls_before
+
+
+# ---------------------------------------------------------------------------
+# What gets said.
+# ---------------------------------------------------------------------------
+
+
+def test_a_decline_is_explained_from_the_rule_not_invented():
+    conversation, session, _ = build(
+        Classification(Event.LANGUAGE_CHOSEN),
+        Classification(Event.CONSENT_GIVEN),
+    )
+    conversation.actions.core_banking.existing_customers.add("9812345678")
+
+    conversation.open(session)
+    conversation.respond(session, "english")
+    reply = conversation.respond(session, "yes")
+
+    assert session.state is State.DECLINED
+    assert DECLINE_TEXT[DeclineReason.ALREADY_A_CUSTOMER] in reply.text
+
+
+def test_the_account_number_is_spoken_exactly():
+    conversation, session, _ = build(*FULL_JOURNEY, kyc_outcomes=[(KycStatus.PENDING, None)])
+    conversation.open(session)
+    for _ in FULL_JOURNEY:
+        conversation.respond(session, "x")
+
+    # Suspended at KYC. The account does not exist yet.
+    assert session.account_number is None
+
+    conversation.resume(session)
+    assert session.account_number
+    assert session.state is State.COMPLETED
+
+
+def test_asking_for_a_human_is_never_refused():
+    """From any live state, at any point."""
+    for state in State:
+        if state in TERMINAL_STATES:
+            continue
+        conversation, session, _ = build(Classification(Event.USER_WANTS_HUMAN))
+        session.state = state
+
+        reply = conversation.respond(session, "mujhe insaan chahiye")
+
+        assert session.state is State.HUMAN_HANDOFF, state
+        assert reply.text.strip()

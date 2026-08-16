@@ -55,9 +55,11 @@ that a model failure and a misheard sentence take the same path.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
+from typing import Any
 
 from google import genai
 from google.genai import errors, types
@@ -138,43 +140,43 @@ class LlmClient:
     def __post_init__(self) -> None:
         self._client = genai.Client(api_key=load_api_key(self.api_key))
 
-    # -- The classifier's call: one value from a closed list ----------------
+    # -- The classifier's call: one constrained object ----------------------
 
-    def choose_one(
+    def extract(
         self,
         *,
         system_instruction: str,
-        utterance: str,
-        options: list[str],
-    ) -> str | None:
-        """Return exactly one member of `options`, or None.
+        prompt: str,
+        schema: types.Schema,
+    ) -> dict[str, Any] | None:
+        """Return one object matching `schema`, or None.
 
-        `options` becomes an `enum` on the response schema, so the constraint
-        is enforced by the API rather than requested in the prompt. The model
-        is not asked what should happen -- it is handed four strings and asked
-        which one this was. That narrowing is the whole reason a language model
-        is safe to have in a banking flow at all.
+        Every field the caller cares about is constrained by the schema rather
+        than requested in the prompt -- the intent is an enum, the field name
+        is an enum, the language is an enum. The model is not asked what should
+        happen; it is handed a shape and asked to fill it in. That narrowing is
+        the whole reason a language model is safe to have in a banking flow.
 
-        The caller still re-checks the answer through `validate_intent`. The
-        schema is the wall; the re-check is the proof the wall held.
+        One call rather than two, deliberately. Classifying the utterance and
+        extracting the value out of it are the same reading of the same
+        sentence, and on a 5-requests-per-minute budget a second round trip to
+        re-read a sentence we have already read is not affordable.
+
+        The caller still re-checks everything that comes back. The schema is
+        the wall; the re-check is the proof the wall held.
         """
-        if not options:
-            return None
-
         try:
             response = self._client.models.generate_content(
                 model=self.model,
-                contents=utterance,
+                contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    response_mime_type="text/x.enum",
-                    response_schema=types.Schema(
-                        type=types.Type.STRING, enum=list(options)
-                    ),
+                    response_mime_type="application/json",
+                    response_schema=schema,
                     thinking_config=CLASSIFY_THINKING,
                     safety_settings=_CLASSIFY_SAFETY,
                     temperature=0.0,
-                    max_output_tokens=512,
+                    max_output_tokens=1024,
                 ),
             )
         except errors.APIError as exc:
@@ -185,15 +187,21 @@ class LlmClient:
             log.warning("classification call failed: %s", exc)
             return None
 
-        answer = (response.text or "").strip()
+        parsed = response.parsed
+        if parsed is None:
+            # `.parsed` is populated by the SDK when a schema is set, but a
+            # truncated or malformed body leaves it empty. Fall back to the
+            # raw text rather than treating a parser quirk as a refusal.
+            try:
+                parsed = json.loads(response.text or "")
+            except (ValueError, TypeError):
+                log.warning("model returned a body that was not valid JSON")
+                return None
 
-        # Belt and braces. The schema should make this impossible; if it ever
-        # is not, an out-of-vocabulary answer must be dropped rather than
-        # passed along as though the model had authority to invent one.
-        if answer not in options:
-            log.warning("model returned %r, not in the offered set", answer)
+        if not isinstance(parsed, dict):
+            log.warning("model returned %s, expected an object", type(parsed).__name__)
             return None
-        return answer
+        return parsed
 
     # -- The phrasing call: say this, in this language -----------------------
 

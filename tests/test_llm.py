@@ -13,6 +13,7 @@ is done with its answer, and what happens when it does not answer.
 from __future__ import annotations
 
 import pytest
+from google.genai import types
 
 from app.flow.intents import classifiable_events
 from app.flow.states import TERMINAL_STATES, Event, State
@@ -22,21 +23,48 @@ from app.llm.speech_acts import SPEECH_ACTS, SpeechAct, SpeechActKind
 
 
 class FakeClient:
-    """Stands in for LlmClient. Records calls; returns scripted answers."""
+    """Stands in for LlmClient. Records calls; returns scripted answers.
 
-    def __init__(self, choose: str | None = None, text: str | None = None):
-        self._choose = choose
+    `choose` is the intent name the model "returns"; None means the call
+    failed, was rate-limited, or came back unusable -- the three cases the
+    conversation treats identically.
+    """
+
+    def __init__(
+        self,
+        choose: str | None = None,
+        text: str | None = None,
+        field: str | None = None,
+        value: str | None = None,
+        language: str | None = None,
+    ):
+        self._answer = {
+            "intent": choose,
+            "field": field,
+            "value": value,
+            "language": language,
+        }
         self._text = text
-        self.choose_calls: list[list[str]] = []
+        self.extract_calls: list[types.Schema] = []
         self.say_calls: list[str] = []
 
-    def choose_one(self, *, system_instruction, utterance, options):
-        self.choose_calls.append(list(options))
-        return self._choose
+    def extract(self, *, system_instruction, prompt, schema):
+        self.extract_calls.append(schema)
+        return dict(self._answer) if self._answer["intent"] is not None else None
 
     def say(self, *, system_instruction, instruction, max_output_tokens=512):
         self.say_calls.append(instruction)
         return self._text
+
+    # -- Helpers so tests can inspect what the model was actually offered ---
+
+    @property
+    def offered_intents(self) -> set[str]:
+        return set(self.extract_calls[0].properties["intent"].enum)
+
+    @property
+    def offered_fields(self) -> set[str]:
+        return set(self.extract_calls[0].properties["field"].enum)
 
 
 # ---------------------------------------------------------------------------
@@ -217,13 +245,13 @@ def test_terminal_states_spend_no_quota(state: State):
     """A finished session accepts nothing. Do not pay to be told so."""
     client = FakeClient(choose="CONSENT_GIVEN")
     assert GeminiIntentClassifier(client).classify("hello", state) is None
-    assert client.choose_calls == []
+    assert client.extract_calls == []
 
 
 def test_silence_spends_no_quota():
     client = FakeClient(choose="CONSENT_GIVEN")
     assert GeminiIntentClassifier(client).classify("   ", State.CONSENT) is None
-    assert client.choose_calls == []
+    assert client.extract_calls == []
 
 
 def test_the_offered_options_never_exceed_the_map():
@@ -231,7 +259,7 @@ def test_the_offered_options_never_exceed_the_map():
     client = FakeClient(choose="CONSENT_GIVEN")
     GeminiIntentClassifier(client).classify("haan ji", State.CONSENT)
 
-    offered = {Event[name] for name in client.choose_calls[0]}
+    offered = {Event[name] for name in client.offered_intents}
     assert offered == classifiable_events(State.CONSENT)
 
 

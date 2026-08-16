@@ -118,7 +118,7 @@ def test_injection_text_never_widens_the_offered_options(utterance: str):
     client = FakeClient(choose=None)
     GeminiIntentClassifier(client).classify(utterance, State.CONSENT)
 
-    offered = set(client.choose_calls[0])
+    offered = client.offered_intents
     assert offered == {"CONSENT_GIVEN", "CONSENT_REFUSED", "LANGUAGE_CHANGE_REQUESTED",
                        "USER_QUIT", "USER_WANTS_HUMAN"}
     assert "ACCOUNT_OPENED" not in offered
