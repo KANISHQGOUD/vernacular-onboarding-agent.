@@ -36,7 +36,18 @@ class Session:
 
     language: str | None = None
     consent_recorded: bool = False
+
+    # REGULATED PERSONAL DATA. Name, date of birth, address, occupation,
+    # mobile. Under the DPDP Act this carries retention limits, correction
+    # rights, and erasure obligations.
     applicant: dict[str, str] = field(default_factory=dict)
+
+    # OPERATIONAL METADATA. Why a KYC attempt failed, why someone escalated.
+    # Deliberately a separate dict rather than underscore-prefixed keys inside
+    # `applicant`: an erasure request has to be able to delete the personal
+    # data while the operational trail survives, and that is impossible when
+    # both live in one dict. Never put personal data in here.
+    notes: dict[str, str] = field(default_factory=dict)
 
     # Both halves of the screening are kept: the answers that went in, and the
     # verdict that came out. eligibility.py promises a decision can be replayed
@@ -69,6 +80,23 @@ class Session:
     def missing_fields(self) -> frozenset[str]:
         return REQUIRED_APPLICANT_FIELDS - self.applicant.keys()
 
+    # -- Erasure ------------------------------------------------------------
+
+    def erase_personal_data(self) -> None:
+        """Honour a deletion request without destroying the audit trail.
+
+        This is the method the `notes` split exists for. It clears the
+        regulated personal data and the screening inputs derived from it,
+        while leaving the state, the decision, the operational notes, and the
+        audit log intact -- so the bank can still answer "was this handled
+        correctly" after it can no longer answer "who was it".
+
+        `eligibility` (the verdict) is kept on purpose; `eligibility_input`
+        (the person's date of birth and residency) is not.
+        """
+        self.applicant.clear()
+        self.eligibility_input = None
+
     # -- Persistence --------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
@@ -78,6 +106,7 @@ class Session:
             "language": self.language,
             "consent_recorded": self.consent_recorded,
             "applicant": dict(self.applicant),
+            "notes": dict(self.notes),
             "eligibility_input": (
                 self.eligibility_input.to_dict() if self.eligibility_input else None
             ),
@@ -97,6 +126,7 @@ class Session:
             language=raw["language"],
             consent_recorded=raw["consent_recorded"],
             applicant=dict(raw["applicant"]),
+            notes=dict(raw.get("notes", {})),
             eligibility_input=(
                 EligibilityInput.from_dict(raw["eligibility_input"])
                 if raw["eligibility_input"]

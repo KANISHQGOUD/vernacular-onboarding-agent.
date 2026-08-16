@@ -94,9 +94,9 @@ class Machine:
     def tools_for(state: State) -> frozenset[ToolName]:
         """The state's tool binding.
 
-        In Phase 2 this is what gets turned into the `tools` parameter of the
-        Claude call -- so this method decides the model's entire action space
-        for the turn.
+        In Phase 2 this is what becomes the tool/function declarations sent to
+        the model -- so this method decides its entire action space for the
+        turn, whichever provider is behind it.
         """
         return STATE_TOOLS[state]
 

@@ -98,7 +98,7 @@ class Actions:
 
     def escalate_to_human(self, session: Session, reason: str) -> Session:
         self.machine.assert_tool_allowed(session, ToolName.ESCALATE_TO_HUMAN)
-        session.applicant["_escalation_reason"] = reason
+        session.notes["escalation_reason"] = reason
         return session
 
     # -- Provider tools: call out, then mint a fact --------------------------
@@ -186,7 +186,7 @@ class Actions:
 
         # FAILED and EXPIRED are the same event; the map's guard decides whether
         # that means another attempt or a human.
-        session.applicant["_last_kyc_failure"] = str(result.failure_reason)
+        session.notes["last_kyc_failure"] = str(result.failure_reason)
         return self.machine.fire(session, Event.KYC_FAILED)
 
     def open_account(self, session: Session) -> Session:
@@ -206,7 +206,7 @@ class Actions:
         )
 
         if not result.opened:
-            session.applicant["_account_failure"] = str(result.failure_reason)
+            session.notes["account_failure"] = str(result.failure_reason)
             return self.machine.fire(session, Event.ACCOUNT_CREATION_FAILED)
 
         session.account_number = result.account_number
@@ -225,7 +225,7 @@ class Actions:
             # No event: a failed deposit leaves the session in FUNDING so the
             # applicant can simply try again. The map has no "deposit failed"
             # edge because failing to add money is not a change of state.
-            session.applicant["_deposit_failure"] = str(result.failure_reason)
+            session.notes["deposit_failure"] = str(result.failure_reason)
             return session
 
         session.deposit_reference = result.reference
@@ -254,7 +254,7 @@ class Actions:
         )
 
         if not result.succeeded:
-            session.applicant["_payment_failure"] = str(result.failure_reason)
+            session.notes["payment_failure"] = str(result.failure_reason)
             return session
 
         session.first_payment_reference = result.reference

@@ -94,7 +94,11 @@ def validate_intent(event: Event, state: State) -> Event:
 
 
 class IntentClassifier(Protocol):
-    """Phase 2 puts Claude behind this. Phase 1 uses the scripted fake below.
+    """A language model sits behind this; Phase 1 uses the scripted fake below.
+
+    Deliberately says nothing about WHICH model. Nothing downstream of this
+    protocol knows or cares -- which is why swapping providers touches this
+    file's implementations and nothing else in the state machine.
 
     Returning None means "I could not tell" -- an honest outcome that the
     conversation layer turns into a re-prompt. It is deliberately not an
@@ -110,8 +114,8 @@ class ScriptedClassifier:
     """A fake with no model behind it, so Phase 1 runs with no API key.
 
     Because it satisfies the same protocol and passes through the same
-    `validate_intent`, the tests written against it keep their meaning when
-    Claude replaces it.
+    `validate_intent`, the tests written against it keep their meaning when a
+    real model replaces it.
     """
 
     script: dict[str, Event] = field(default_factory=dict)
