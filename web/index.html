@@ -80,6 +80,7 @@
 <footer>
   <input id="input" placeholder="Type what a caller would say…" autocomplete="off" maxlength="500" disabled>
   <button id="send" disabled>Send</button>
+  <button id="retry" hidden>Reconnect</button>
 </footer>
 
 <script>
@@ -89,9 +90,18 @@ const stateEl = document.getElementById("state");
 const statusEl = document.getElementById("status");
 const input = document.getElementById("input");
 const send = document.getElementById("send");
+const retry = document.getElementById("retry");
 
 let socket = null;
 let credentials = null;
+let attempts = 0;
+let needsNewSession = false;
+
+// Six tries over roughly half a minute is long enough to ride out a restart
+// and short enough that a genuinely dead server is reported rather than
+// silently retried forever.
+const MAX_ATTEMPTS = 6;
+const MAX_BACKOFF_MS = 10000;
 
 function bubble(who, text, meta) {
   const wrap = document.createElement("div");
@@ -153,7 +163,12 @@ function connect() {
 
   socket = new WebSocket(url);
 
-  socket.onopen = () => setLive(true, "connected");
+  socket.onopen = () => {
+    attempts = 0;
+    needsNewSession = false;
+    retry.hidden = true;
+    setLive(true, "connected");
+  };
 
   socket.onmessage = (event) => {
     const data = JSON.parse(event.data);
@@ -174,16 +189,40 @@ function connect() {
 
   socket.onclose = (event) => {
     if (event.code === 1008) {
-      setLive(false, "not authorised");
-      bubble("note", "That session token was rejected.");
+      // The session this page holds no longer exists on the server. In
+      // practice that almost always means the server restarted -- sessions
+      // live in memory, so a restart drops every one of them. Reconnecting
+      // cannot help; the only recovery is a new session, so offer that
+      // rather than leaving the page stuck saying "not authorised".
+      setLive(false, "session expired");
+      bubble("note", "This session is no longer on the server, most likely because it restarted.");
+      needsNewSession = true;
+      retry.textContent = "Start a new session";
+      retry.hidden = false;
       return;
     }
+
     setLive(false, "disconnected");
+
     // Reconnecting resumes the same session -- the server reloads it and
     // carries on from whatever state it is actually in. Same mechanism the
     // KYC handoff uses; a dropped socket is just a very short version of it.
-    bubble("note", "Connection lost. Reconnecting…");
-    setTimeout(connect, 1500);
+    //
+    // Backoff rather than a fixed interval: a server that is down stays down
+    // for a while, and retrying every 1.5s forever hammers it through its
+    // own recovery. Give up eventually and say so -- an application that
+    // claims to be "reconnecting…" an hour later is lying to the user.
+    if (attempts >= MAX_ATTEMPTS) {
+      bubble("note", "Could not reconnect. The server may not be running.");
+      retry.hidden = false;
+      statusEl.textContent = "offline";
+      return;
+    }
+
+    const wait = Math.min(1000 * Math.pow(2, attempts), MAX_BACKOFF_MS);
+    attempts += 1;
+    bubble("note", `Connection lost. Retrying in ${Math.round(wait / 1000)}s…`);
+    setTimeout(connect, wait);
   };
 }
 
@@ -194,6 +233,26 @@ function submit() {
   socket.send(JSON.stringify({ utterance: text }));
   input.value = "";
 }
+
+retry.addEventListener("click", () => {
+  attempts = 0;
+  retry.hidden = true;
+
+  if (needsNewSession) {
+    // A genuinely new application. Clear the transcript so the old one is
+    // not mistaken for part of it.
+    needsNewSession = false;
+    retry.textContent = "Reconnect";
+    chat.replaceChildren();
+    trail.replaceChildren();
+    bubble("note", "Starting a new session…");
+    start();
+    return;
+  }
+
+  bubble("note", "Reconnecting…");
+  connect();
+});
 
 send.addEventListener("click", submit);
 input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });

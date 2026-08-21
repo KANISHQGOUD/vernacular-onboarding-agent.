@@ -19,6 +19,18 @@ applicant leaving for a video call and coming back hours later is just a very
 long disconnection -- which is why `Conversation.resume()` needed to be a real
 method rather than demo scaffolding.
 
+SESSIONS DO NOT SURVIVE A RESTART
+---------------------------------
+The registry is in memory, so restarting the server drops every live session.
+A browser holding an old id and token then fails authorisation and gets a 1008
+close -- correctly, since that session genuinely no longer exists.
+
+Worth stating plainly because the symptom is confusing: the page says the
+session expired when the real cause is that the process did. The frontend
+handles it by offering a new session rather than sitting on a dead one, and
+the durable fix is the Postgres store the SessionStore protocol already exists
+for. Until then, a restart means starting over.
+
 WHAT THE SOCKET REFUSES
 -----------------------
 Utterances are bounded and non-empty. The text goes into a model prompt, and
