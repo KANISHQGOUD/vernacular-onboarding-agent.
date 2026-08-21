@@ -34,6 +34,7 @@ import collections
 import os
 import threading
 import uuid
+from datetime import date
 
 import pytest
 
@@ -394,3 +395,211 @@ def test_the_database_refuses_to_truncate_the_audit_trail(sink, schema):
         connection.rollback()
 
     assert len(sink.for_session(session_id)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Erasure. Delete the person, keep the trail.
+#
+# HOW FAR "DELETED" GOES, MEASURED
+# --------------------------------
+# These tests assert erasure at the SQL level -- the level the application, an
+# auditor, and anyone with a psql prompt actually see. That is not the same as
+# the bytes being gone, and the difference is worth stating rather than
+# discovering during a regulatory conversation.
+#
+# UPDATE in Postgres writes a new row version and leaves the old one behind as
+# a dead tuple. Checked with pageinspect against this schema: after erase and
+# save, a marker planted in `applicant` was unreachable by SQL (0 rows) and
+# still sitting in the heap page (1 page) -- and still there after a plain
+# VACUUM, because VACUUM marks space reusable without zeroing it.
+#
+# What does remove it: VACUUM FULL or pg_repack, which rewrite the table; or
+# eventual overwrite by new tuples. Separately, the WAL keeps the old value for
+# its retention window, and so does every backup taken before the erasure.
+#
+# So the honest claim is "erased from the database" and not "erased from the
+# disk". A real deployment answering a DPDP request needs the second, which is
+# an operational procedure, not a method call.
+# ---------------------------------------------------------------------------
+
+
+def _stored_text(conninfo: str, session_id: str) -> str:
+    """Everything this session has left in the database, as one searchable string.
+
+    `data::text` on purpose: this reads what Postgres actually stored, not what
+    `Session.from_dict` chooses to hand back. Asserting through the loader
+    would only prove the loader agrees with the saver, which is the same
+    circularity this module's docstring refuses mocks for.
+    """
+    with psycopg.connect(conninfo) as connection:
+        row = connection.execute(
+            "SELECT data::text FROM sessions WHERE session_id = %s", (session_id,)
+        ).fetchone()
+        trail = connection.execute(
+            """
+            SELECT kind, from_state, to_state, event, tool, detail
+            FROM audit_events WHERE session_id = %s
+            """,
+            (session_id,),
+        ).fetchall()
+
+    parts = [row[0] if row else ""]
+    parts.extend(str(value) for record in trail for value in record if value is not None)
+    return " ".join(parts)
+
+
+def _applicant_with_everything() -> dict[str, str]:
+    """Every field REQUIRED_APPLICANT_FIELDS names, all of it personal data."""
+    return {
+        "full_name": "Asha Devi Rathore",
+        "date_of_birth": "1990-01-01",
+        "address": "14 Gandhi Marg, Jaipur 302001",
+        "occupation": "weaver",
+        "mobile": "9812345678",
+    }
+
+
+def test_erasure_removes_the_person_from_the_database(store, schema):
+    """The applicant / notes split, verified where the data actually sits.
+
+    `test_security.py` already checks this in memory, but an in-memory store
+    holds the Session object itself -- there are no stored bytes to search, so
+    "the person is gone" can only be asserted about the object. Here there is a
+    row, and the question is whether the person is still inside it.
+    """
+    from app.flow.eligibility import evaluate
+    from tests.conftest import eligible_applicant
+
+    session = Session(session_id=fresh_id(), state=State.COMPLETED)
+    session.language = "hi-IN"
+    session.consent_recorded = True
+    session.applicant = _applicant_with_everything()
+    session.notes = {"last_kyc_failure": "NETWORK_DROPPED", "attempts": "2"}
+    session.eligibility_input = eligible_applicant()
+    session.eligibility = evaluate(session.eligibility_input)
+    session.account_number = "00012345678"
+    store.save(session)
+
+    # The test proves nothing unless the data was genuinely in there first.
+    before = _stored_text(schema, session.session_id)
+    for value in _applicant_with_everything().values():
+        assert value in before, f"{value} was never stored, so erasing it proves nothing"
+
+    session.erase_personal_data()
+    store.save(session)
+
+    after = _stored_text(schema, session.session_id)
+    for name, value in _applicant_with_everything().items():
+        assert value not in after, f"{name} survived erasure in the stored row"
+
+    loaded = store.load(session.session_id)
+    assert loaded is not None, "erasure deleted the session, not just the person"
+    assert loaded.applicant == {}
+    assert loaded.eligibility_input is None, "date of birth and residency survived"
+
+    # What the bank must still be able to answer afterwards.
+    assert loaded.eligibility == session.eligibility, "the decision did not survive"
+    assert loaded.state is State.COMPLETED
+    assert loaded.account_number == "00012345678"
+    assert loaded.notes["last_kyc_failure"] == "NETWORK_DROPPED"
+
+
+def test_the_surviving_decision_carries_no_personal_data(store, schema):
+    """Erasure would be pointless if the verdict quietly kept its inputs.
+
+    `EligibilityDecision` is ruleset_version, passed, and a rule_id / passed /
+    decline_reason per rule -- structural all the way down, which is what makes
+    keeping it compatible with erasing the person. This pins that shape down,
+    because a later rule that helpfully recorded "declined: born 2015-06-30"
+    would breach the erasure guarantee without touching a line of this file.
+    """
+    from app.flow.eligibility import evaluate
+    from tests.conftest import eligible_applicant
+
+    # Young enough to fail the age rule, so there are real decline reasons.
+    applicant = eligible_applicant(date_of_birth=date(2015, 6, 30))
+
+    session = Session(session_id=fresh_id())
+    session.applicant = _applicant_with_everything()
+    session.eligibility_input = applicant
+    session.eligibility = evaluate(applicant)
+    assert not session.eligibility.passed, "pick an input that actually declines"
+
+    store.save(session)
+    session.erase_personal_data()
+    store.save(session)
+
+    after = _stored_text(schema, session.session_id)
+    assert "2015-06-30" not in after, "the date of birth survived inside the decision"
+
+    loaded = store.load(session.session_id)
+    assert loaded.eligibility.decline_reasons, "the reasons should outlive the person"
+
+
+def test_erasure_leaves_the_audit_trail_untouched(store, sink, schema):
+    """The point of the split: answer "was this handled correctly" after you
+    can no longer answer "who was it".
+
+    The trail refuses UPDATE, DELETE and TRUNCATE, so it could not be scrubbed
+    even deliberately. That only stays compatible with an erasure request
+    because nothing personal is written there in the first place.
+    """
+    session = Session(session_id=fresh_id(), state=State.COMPLETED)
+    session.applicant = _applicant_with_everything()
+    store.save(session)
+
+    sink.append(
+        session.session_id,
+        AuditKind.TRANSITION_ACCEPTED,
+        from_state=State.START,
+        to_state=State.LANGUAGE_SELECT,
+        event=Event.SESSION_STARTED,
+        detail="unconditional",
+    )
+    sink.append(
+        session.session_id,
+        AuditKind.TOOL_ALLOWED,
+        from_state=State.ACCOUNT_CREATE,
+        tool="open_account",
+    )
+    before = sink.for_session(session.session_id)
+
+    session.erase_personal_data()
+    store.save(session)
+
+    after = sink.for_session(session.session_id)
+    assert after == before, "erasing the person changed the trail"
+    assert [record.sequence for record in after] == [0, 1]
+    assert after[0].detail == "unconditional"
+
+
+def test_the_audit_trail_never_held_the_person_to_begin_with(store, sink):
+    """Erasure cannot reach an append-only table, so the guarantee has to come
+    from never writing personal data there -- not from cleaning it up later."""
+    from app.flow.machine import Machine
+
+    session = Session(session_id=fresh_id())
+    session.applicant = _applicant_with_everything()
+    store.save(session)
+
+    Machine(sink).fire(session, Event.SESSION_STARTED)
+    store.save(session)
+
+    trail = sink.for_session(session.session_id)
+    assert trail, "the transition should have been recorded"
+
+    written = " ".join(
+        str(value)
+        for record in trail
+        for value in (
+            record.kind,
+            record.from_state,
+            record.to_state,
+            record.event,
+            record.tool,
+            record.detail,
+        )
+        if value is not None
+    )
+    for name, value in _applicant_with_everything().items():
+        assert value not in written, f"{name} reached the audit trail"
