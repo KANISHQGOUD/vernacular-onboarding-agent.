@@ -6,6 +6,12 @@ import sys
 from datetime import date
 
 import pytest
+from dotenv import load_dotenv
+
+# So DATABASE_URL in .env actually enables the Postgres tests. Without this,
+# putting it in .env and running pytest would silently keep skipping them,
+# which is the kind of papercut that gets read as "the tests are broken".
+load_dotenv()
 
 from app.audit import InMemoryAuditSink
 from app.flow.eligibility import EligibilityInput, Residency

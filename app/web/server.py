@@ -42,6 +42,7 @@ first, before the call is billed rather than after.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -105,12 +106,45 @@ def build_conversation(audit: InMemoryAuditSink) -> Conversation:
     return Conversation(actions, OfflineClassifier(), Phraser(client=None))
 
 
+def build_storage() -> tuple[SessionRegistry, object]:
+    """Postgres when DATABASE_URL is set, memory otherwise.
+
+    The choice is made here and nowhere else. `SessionStore`, `TokenStore` and
+    `AuditSink` have been protocols since the first commit, so everything above
+    this function is identical either way -- including the state machine, which
+    does not import either implementation.
+    """
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        log.warning(
+            "DATABASE_URL is empty -- sessions live in memory and a restart "
+            "will drop every one of them"
+        )
+        return SessionRegistry(), InMemoryAuditSink()
+
+    # Imported lazily so the app still starts with no psycopg installed.
+    from app.store.postgres import (
+        PostgresAuditSink,
+        PostgresSessionStore,
+        PostgresTokenStore,
+    )
+
+    log.info("using Postgres for sessions and the audit trail")
+    registry = SessionRegistry(
+        store=PostgresSessionStore(url),
+        tokens=PostgresTokenStore(url),
+    )
+    return registry, PostgresAuditSink(url)
+
+
 def create_app(
     registry: SessionRegistry | None = None,
     conversation: Conversation | None = None,
     audit: InMemoryAuditSink | None = None,
 ) -> FastAPI:
     """Everything injectable, so tests never touch the network."""
+    if registry is None and audit is None:
+        registry, audit = build_storage()
     audit = audit or InMemoryAuditSink()
     registry = registry or SessionRegistry()
     conversation = conversation or build_conversation(audit)
