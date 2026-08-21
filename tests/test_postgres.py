@@ -5,6 +5,23 @@ default. There is deliberately no mock here: the whole value of this layer is
 whether the SQL is right, and a fake connection that agrees with my SQL proves
 only that I am consistent with myself.
 
+SKIPPING IS A CHOICE, NOT A CONFIGURATION ACCIDENT
+--------------------------------------------------
+Those are two different situations, and this file treats them differently:
+
+    no DATABASE_URL at all   ->  skip. Running offline, on purpose.
+    DATABASE_URL, but empty  ->  error. You meant to configure this and did not.
+
+The second used to skip as well. That is how this whole layer went a commit
+without a single line of its SQL ever executing, while the summary read
+"822 passed, 14 skipped" and looked healthy. A blank value is not a decision to
+run offline; it is a decision that failed halfway.
+
+The skip above still handles the honest case. The dishonest one is caught by
+`tests/test_env_config.py`, which lives in its own module precisely because the
+`pytestmark` on this one would skip it too -- a guard that skips under the
+conditions it exists to detect is not a guard.
+
     docker run -d --name onboarding-db -p 5432:5432 \\
       -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=onboarding postgres:17
     .venv\\Scripts\\python.exe scripts/db.py apply
