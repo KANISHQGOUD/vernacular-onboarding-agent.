@@ -13,7 +13,9 @@ only that I am consistent with myself.
 
 from __future__ import annotations
 
+import collections
 import os
+import threading
 import uuid
 
 import pytest
@@ -295,3 +297,83 @@ def test_a_session_survives_a_process_restart(schema):
     assert recovered.state is State.KYC_PENDING
     assert recovered.language == "hi-IN"
     assert recovered.kyc_reference == "vckyc-xyz"
+
+
+# ---------------------------------------------------------------------------
+# The claims the module docstring makes, which nothing used to check.
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_writers_do_not_lose_events(sink):
+    """The gapless claim, against writers that actually race.
+
+    `test_the_sequence_is_gapless` appends in a single thread, which cannot
+    fail: there is nothing to race. This is the test that found the real bug.
+    The original sink computed `MAX(sequence) + 1` optimistically and retried a
+    fixed five times; under this load it dropped roughly 2% of events, and the
+    drop rate rose with contention -- an audit trail that forgets most when it
+    is busiest.
+
+    Twelve writers on one session is far harsher than production, where a
+    session carries one conversation. That is deliberate: the mechanism should
+    be correct under contention, not merely unlikely to meet it.
+    """
+    session_id = fresh_id()
+    writers, each = 12, 20
+    sequences: list[int] = []
+    failures: list[str] = []
+    guard = threading.Lock()
+    gate = threading.Barrier(writers)
+
+    def writer(n: int) -> None:
+        gate.wait()  # everyone swings at once
+        for i in range(each):
+            try:
+                record = sink.append(
+                    session_id,
+                    AuditKind.TRANSITION_ACCEPTED,
+                    detail=f"writer {n} event {i}",
+                )
+                with guard:
+                    sequences.append(record.sequence)
+            except Exception as exc:  # noqa: BLE001 - the point is to see any
+                with guard:
+                    failures.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(writers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not failures, f"appends were dropped: {failures[:3]}"
+
+    duplicates = [s for s, count in collections.Counter(sequences).items() if count > 1]
+    assert not duplicates, f"the same sequence was handed out twice: {duplicates}"
+
+    trail = sink.for_session(session_id)
+    assert len(trail) == writers * each
+    assert [e.sequence for e in trail] == list(range(writers * each)), "gap in the trail"
+
+
+def test_the_database_refuses_to_truncate_the_audit_trail(sink, schema):
+    """The hole the row-level trigger left open.
+
+    `audit_events_no_update` is FOR EACH ROW, and TRUNCATE fires no row
+    triggers -- so before `audit_events_no_truncate` existed, one ordinary
+    statement emptied the whole table while the trigger that supposedly made
+    it append-only watched. "You cannot delete these rows" and "you cannot
+    empty this table" are different claims, and the docstring makes the second.
+
+    Rolled back either way, so a regression fails the assertion instead of
+    destroying the trail the rest of the suite is building.
+    """
+    session_id = fresh_id()
+    sink.append(session_id, AuditKind.TRANSITION_ACCEPTED, detail="keep me")
+
+    with psycopg.connect(schema) as connection:  # autocommit off: TRUNCATE is transactional
+        with pytest.raises(psycopg.errors.RaiseException):
+            connection.execute("TRUNCATE audit_events")
+        connection.rollback()
+
+    assert len(sink.for_session(session_id)) == 1

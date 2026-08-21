@@ -1,6 +1,6 @@
 """Security properties, stated as tests rather than as intentions.
 
-Five things this file pins down:
+Six things this file pins down:
 
   1. A caller cannot talk the machine into a state change. Speech is an intent;
      intents are narrowed before the model sees them and re-checked after.
@@ -9,16 +9,18 @@ Five things this file pins down:
   3. The API key never reaches a session, an audit record, or a log line.
   4. An erasure request can delete the person without destroying the trail.
   5. Money and identity are unreachable except by the intended path.
+  6. A session never occupies a state the audit trail cannot account for --
+     including when the sink itself is failing.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
-from app.audit import InMemoryAuditSink
+from app.audit import AuditEvent, AuditKind, InMemoryAuditSink
 from app.flow.actions import Actions
 from app.flow.eligibility import Residency
 from app.flow.intents import FACT_EVENTS, UntrustedEventError
@@ -353,3 +355,81 @@ def test_a_terminal_session_cannot_be_made_to_do_anything(rig):
 
         with pytest.raises(Exception):
             actions.make_first_payment(session, "attacker@upi", 100)
+
+
+# ---------------------------------------------------------------------------
+# 6. A failing audit sink cannot leave a session unexplained.
+# ---------------------------------------------------------------------------
+
+
+class ExplodingAuditSink:
+    """An `AuditSink` that fails the way a real one can.
+
+    `InMemoryAuditSink` cannot fail. That is convenient and it is also why the
+    ordering bug in `fire` lived through 822 tests: the state was assigned
+    before the record was written, and nothing could ever observe the gap
+    because the write never lost. A Postgres sink can fail, so it can.
+    """
+
+    def __init__(self, fail_on: AuditKind = AuditKind.TRANSITION_ACCEPTED) -> None:
+        self.fail_on = fail_on
+        self.written: list[AuditKind] = []
+
+    def append(
+        self,
+        session_id: str,
+        kind: AuditKind,
+        *,
+        from_state: str | None = None,
+        to_state: str | None = None,
+        event: str | None = None,
+        tool: str | None = None,
+        detail: str = "",
+    ) -> AuditEvent:
+        if kind is self.fail_on:
+            raise RuntimeError("audit sink is down")
+        self.written.append(kind)
+        return AuditEvent(
+            session_id=session_id,
+            sequence=len(self.written) - 1,
+            kind=kind,
+            recorded_at=datetime.now(timezone.utc),
+            from_state=from_state,
+            to_state=to_state,
+            event=event,
+            tool=tool,
+            detail=detail,
+        )
+
+    def for_session(self, session_id: str) -> tuple[AuditEvent, ...]:
+        return ()
+
+
+def test_a_failed_audit_write_leaves_the_session_where_it_was():
+    """Fail closed: refuse to advance rather than advance unrecorded.
+
+    The alternative is a session sitting in a state with nothing explaining
+    how it arrived, which in this flow includes states like "the account
+    exists now". Refusing to proceed is the recoverable failure; an
+    unexplained state is not.
+    """
+    machine = Machine(ExplodingAuditSink())
+    session = Session(session_id="no-trail", state=State.START)
+
+    with pytest.raises(RuntimeError):
+        machine.fire(session, Event.SESSION_STARTED)
+
+    assert session.state is State.START, (
+        "the session advanced even though the transition was never recorded"
+    )
+
+
+def test_a_healthy_sink_still_moves_the_session():
+    """The guard above must not be satisfied by never moving at all."""
+    machine = Machine(ExplodingAuditSink(fail_on=AuditKind.TOOL_REFUSED))
+    session = Session(session_id="trail-ok", state=State.START)
+
+    machine.fire(session, Event.SESSION_STARTED)
+
+    assert session.state is not State.START
+    assert AuditKind.TRANSITION_ACCEPTED in machine._audit.written

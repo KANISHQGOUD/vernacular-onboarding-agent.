@@ -154,6 +154,20 @@ class Machine:
 
         Terminal states need no special case here -- they have no rows in the
         map, so every event raises IllegalTransitionError naturally.
+
+        FAIL CLOSED: THE RECORD IS WRITTEN BEFORE THE MOVE
+        --------------------------------------------------
+        The accepted branch audits first and assigns `session.state` second,
+        and the order is the point. If the sink raises, the session has not
+        moved and the caller sees the failure -- rather than advancing into a
+        state with no row explaining how it got there.
+
+        This used to be the other way round, and no test could catch it:
+        `InMemoryAuditSink` cannot fail, so the ordering never mattered until a
+        Postgres sink made a failed append reachable. The invariant worth
+        stating is that a session never occupies a state the trail cannot
+        account for, and in a flow where one of those states is "the account
+        exists now", losing that is worse than refusing to proceed.
         """
         origin = session.state
         candidates: tuple[Transition, ...] | None = TRANSITIONS.get((origin, event))
@@ -174,7 +188,9 @@ class Machine:
             # is last in the tuple, so reaching it means every guarded
             # alternative was already tried and rejected.
             if candidate.guard is None or candidate.guard(session):
-                session.state = candidate.to
+                # Write the justification, then move. Not the reverse: see the
+                # docstring. An append that raises here leaves the session
+                # exactly where it was.
                 self._audit.append(
                     session.session_id,
                     AuditKind.TRANSITION_ACCEPTED,
@@ -183,6 +199,7 @@ class Machine:
                     event=str(event),
                     detail=candidate.why,
                 )
+                session.state = candidate.to
                 return session
 
         self._audit.append(

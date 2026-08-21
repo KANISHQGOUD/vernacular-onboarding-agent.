@@ -14,6 +14,17 @@
 -- table's owner. Revoking the grants would stop an application bug; the
 -- trigger also stops a person who means it.
 --
+-- Row triggers alone are not enough. TRUNCATE removes every row without firing
+-- a single row trigger, so the original BEFORE UPDATE OR DELETE trigger let
+-- `TRUNCATE audit_events` empty the table unchallenged -- verified, not
+-- assumed. A second statement-level trigger closes that.
+--
+-- The honest limit: DROP TABLE, and `ALTER TABLE ... DISABLE TRIGGER`, are
+-- still open to the owner. No trigger can defend against them. What this buys
+-- is that erasing the trail is no longer one ordinary statement -- it takes a
+-- deliberate schema change, which is a different thing to do by accident and a
+-- different thing to explain afterwards.
+--
 -- Written to be run more than once. Every statement is idempotent, so applying
 -- it to an existing database is a no-op rather than an error.
 
@@ -67,6 +78,14 @@ CREATE INDEX IF NOT EXISTS audit_events_session_idx
 CREATE OR REPLACE FUNCTION audit_events_are_append_only()
 RETURNS trigger AS $$
 BEGIN
+    -- A statement-level trigger has no OLD row to name, and touching OLD there
+    -- is itself an error -- which would replace this clear refusal with a
+    -- confusing one.
+    IF TG_LEVEL = 'STATEMENT' THEN
+        RAISE EXCEPTION
+            'audit_events is append-only: % rejected on the whole table', TG_OP;
+    END IF;
+
     RAISE EXCEPTION
         'audit_events is append-only: % rejected on session %',
         TG_OP, COALESCE(OLD.session_id, '(unknown)');
@@ -77,6 +96,14 @@ DROP TRIGGER IF EXISTS audit_events_no_update ON audit_events;
 CREATE TRIGGER audit_events_no_update
     BEFORE UPDATE OR DELETE ON audit_events
     FOR EACH ROW EXECUTE FUNCTION audit_events_are_append_only();
+
+-- TRUNCATE fires no row triggers, so the one above never sees it. This is the
+-- difference between "you cannot delete these rows" and "you cannot empty this
+-- table", and only the second is the claim the module docstring makes.
+DROP TRIGGER IF EXISTS audit_events_no_truncate ON audit_events;
+CREATE TRIGGER audit_events_no_truncate
+    BEFORE TRUNCATE ON audit_events
+    FOR EACH STATEMENT EXECUTE FUNCTION audit_events_are_append_only();
 
 -- Keep updated_at honest without the application having to remember.
 CREATE OR REPLACE FUNCTION sessions_touch_updated_at()
