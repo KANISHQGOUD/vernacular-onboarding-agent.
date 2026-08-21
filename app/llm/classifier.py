@@ -205,6 +205,28 @@ def build_prompt(utterance: str, offered: list[Event]) -> str:
 
 
 @dataclass
+class OfflineClassifier:
+    """Understands nothing, on purpose, and says so honestly.
+
+    Used when there is no API key. The alternative -- constructing a real
+    classifier around a None client -- produces an object that builds fine and
+    raises AttributeError on the first caller utterance, which is how a missing
+    key turns into a dropped connection mid-application instead of a clear
+    message at startup.
+
+    Returning None is already the "I could not tell" path the whole loop is
+    built around, so the agent degrades to asking people to repeat themselves
+    rather than pretending to work.
+    """
+
+    def read(self, utterance: str, state: State) -> Classification | None:
+        return None
+
+    def classify(self, utterance: str, state: State) -> Event | None:
+        return None
+
+
+@dataclass
 class GeminiIntentClassifier:
     """Satisfies `IntentClassifier`, exactly like `ScriptedClassifier` does.
 

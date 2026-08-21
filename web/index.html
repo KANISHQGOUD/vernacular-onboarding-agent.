@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vernacular onboarding agent</title>
+<style>
+  :root {
+    --bg: #12100e; --panel: #1b1815; --line: #2f2a25;
+    --text: #ece7e0; --dim: #8f867c; --accent: #d98a4f; --ok: #6f9f5c;
+    --font: ui-sans-serif, system-ui, "Segoe UI", "Noto Sans Devanagari", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--font); height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--dim); font-size: 13px; }
+  #status { margin-left: auto; font-size: 12px; color: var(--dim); }
+  #status.live::before { content: "● "; color: var(--ok); }
+  #status.dead::before { content: "● "; color: var(--accent); }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr 300px; min-height: 0; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } #side { display: none; } }
+
+  #chat { overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 62ch; line-height: 1.55; }
+  .msg .who { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); margin-bottom: 4px; }
+  .msg.you { align-self: flex-end; text-align: right; }
+  .msg.you .body { background: #2a2420; padding: 9px 13px; border-radius: 12px 12px 2px 12px; display: inline-block; }
+  .msg.agent .body { background: var(--panel); padding: 9px 13px; border-radius: 12px 12px 12px 2px; display: inline-block; border: 1px solid var(--line); }
+  .msg.note { color: var(--dim); font-size: 12px; font-style: italic; align-self: center; }
+  .meta { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  .meta .moved { color: var(--ok); }
+  .meta .stuck { color: var(--accent); }
+
+  #side { border-left: 1px solid var(--line); padding: 18px; overflow-y: auto; }
+  #side h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); margin: 0 0 10px; }
+  #state { font-size: 14px; margin-bottom: 20px; word-break: break-word; }
+  #trail { list-style: none; margin: 0; padding: 0; font-size: 12px; color: var(--dim); }
+  #trail li { padding: 3px 0; border-left: 2px solid var(--line); padding-left: 10px; }
+  #trail li.now { color: var(--text); border-left-color: var(--accent); }
+
+  footer { border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 10px; }
+  input {
+    flex: 1; background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    padding: 11px 14px; border-radius: 8px; font: inherit; font-size: 14px;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent); border: 0; color: #1a1410; font: inherit; font-weight: 600;
+    padding: 0 20px; border-radius: 8px; cursor: pointer;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Vernacular onboarding agent</h1>
+  <span class="sub">speak any Indian language &middot; the state machine decides, the model only phrases</span>
+  <span id="status">connecting</span>
+</header>
+
+<main>
+  <div id="chat"></div>
+  <aside id="side">
+    <h2>Current state</h2>
+    <div id="state">&mdash;</div>
+    <h2>Path taken</h2>
+    <ol id="trail"></ol>
+  </aside>
+</main>
+
+<footer>
+  <input id="input" placeholder="Type what a caller would say…" autocomplete="off" maxlength="500" disabled>
+  <button id="send" disabled>Send</button>
+</footer>
+
+<script>
+const chat = document.getElementById("chat");
+const trail = document.getElementById("trail");
+const stateEl = document.getElementById("state");
+const statusEl = document.getElementById("status");
+const input = document.getElementById("input");
+const send = document.getElementById("send");
+
+let socket = null;
+let credentials = null;
+
+function bubble(who, text, meta) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + who;
+  if (who !== "note") {
+    const label = document.createElement("div");
+    label.className = "who";
+    label.textContent = who === "you" ? "caller" : "agent";
+    wrap.appendChild(label);
+  }
+  const body = document.createElement("div");
+  body.className = who === "note" ? "" : "body";
+  body.textContent = text;
+  wrap.appendChild(body);
+  if (meta) {
+    const m = document.createElement("div");
+    m.className = "meta";
+    m.innerHTML = meta;
+    wrap.appendChild(m);
+  }
+  chat.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function recordState(state, moved) {
+  stateEl.textContent = state;
+  const previous = trail.lastElementChild;
+  if (previous) previous.classList.remove("now");
+  if (!previous || previous.dataset.state !== state) {
+    const li = document.createElement("li");
+    li.textContent = state;
+    li.dataset.state = state;
+    li.className = "now";
+    trail.appendChild(li);
+  } else {
+    previous.classList.add("now");
+  }
+}
+
+function setLive(live, label) {
+  statusEl.className = live ? "live" : "dead";
+  statusEl.textContent = label;
+  input.disabled = !live;
+  send.disabled = !live;
+  if (live) input.focus();
+}
+
+async function start() {
+  const created = await fetch("/api/session", { method: "POST" }).then(r => r.json());
+  credentials = created;
+  connect();
+}
+
+function connect() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${scheme}://${location.host}/ws`
+    + `?session=${encodeURIComponent(credentials.session_id)}`
+    + `&token=${encodeURIComponent(credentials.token)}`;
+
+  socket = new WebSocket(url);
+
+  socket.onopen = () => setLive(true, "connected");
+
+  socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.error) { bubble("note", data.error); return; }
+
+    const movement = data.moved
+      ? `<span class="moved">moved</span> to ${data.state}`
+      : `<span class="stuck">stayed</span> in ${data.state}`;
+    const understood = data.understood ? "" : " &middot; not understood";
+    bubble("agent", data.text, movement + understood);
+    recordState(data.state, data.moved);
+
+    if (data.finished) {
+      setLive(false, "session finished");
+      bubble("note", "This session is complete. Reload to start another.");
+    }
+  };
+
+  socket.onclose = (event) => {
+    if (event.code === 1008) {
+      setLive(false, "not authorised");
+      bubble("note", "That session token was rejected.");
+      return;
+    }
+    setLive(false, "disconnected");
+    // Reconnecting resumes the same session -- the server reloads it and
+    // carries on from whatever state it is actually in. Same mechanism the
+    // KYC handoff uses; a dropped socket is just a very short version of it.
+    bubble("note", "Connection lost. Reconnecting…");
+    setTimeout(connect, 1500);
+  };
+}
+
+function submit() {
+  const text = input.value.trim();
+  if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
+  bubble("you", text);
+  socket.send(JSON.stringify({ utterance: text }));
+  input.value = "";
+}
+
+send.addEventListener("click", submit);
+input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+
+start();
+</script>
+</body>
+</html>
