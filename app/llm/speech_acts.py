@@ -54,6 +54,7 @@ class SpeechActKind(StrEnum):
     ASK_FOR_DEPOSIT = "ASK_FOR_DEPOSIT"
     GUIDE_FIRST_PAYMENT = "GUIDE_FIRST_PAYMENT"
     CONFIRM_COMPLETED = "CONFIRM_COMPLETED"
+    ACKNOWLEDGE_NO_CONSENT = "ACKNOWLEDGE_NO_CONSENT"
     HANDING_TO_HUMAN = "HANDING_TO_HUMAN"
     DID_NOT_UNDERSTAND = "DID_NOT_UNDERSTAND"
 
@@ -99,6 +100,19 @@ SPEECH_ACTS: Mapping[SpeechActKind, SpeechActSpec] = MappingProxyType(
                     "One question only."
                 ),
                 fallback="Could you tell me your {field_label}?",
+            ),
+            SpeechActSpec(
+                kind=SpeechActKind.ACKNOWLEDGE_NO_CONSENT,
+                intent=(
+                    "Accept that they have said no. Tell them plainly that nothing "
+                    "will be recorded or processed, and that they can start again "
+                    "whenever they want to. Do not ask why, do not offer to "
+                    "explain it differently, and do not try to change their mind."
+                ),
+                fallback=(
+                    "That's alright. I won't record or use any of your details. "
+                    "If you change your mind, you can start again any time."
+                ),
             ),
             SpeechActSpec(
                 kind=SpeechActKind.ANNOUNCE_DECLINE,

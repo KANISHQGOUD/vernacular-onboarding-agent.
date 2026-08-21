@@ -7,7 +7,7 @@ import pytest
 from app.audit import AuditKind, InMemoryAuditSink
 from app.flow.eligibility import evaluate
 from app.flow.machine import IllegalTransitionError, Machine
-from app.flow.states import MAX_KYC_ATTEMPTS, Event, State
+from app.flow.states import MAX_KYC_ATTEMPTS, TERMINAL_STATES, Event, State
 from app.session import InMemorySessionStore, Session
 from tests.conftest import complete_applicant_data, eligible_applicant
 
@@ -239,3 +239,114 @@ def test_the_trail_cannot_be_edited_through_the_reader(audit: InMemoryAuditSink)
     assert isinstance(trail, tuple)
     with pytest.raises((AttributeError, TypeError)):
         trail[0].detail = "tampered"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Saying no is an answer. Not answering is not.
+# ---------------------------------------------------------------------------
+
+
+def _at_consent(machine: Machine, session: Session) -> Session:
+    machine.fire(session, Event.SESSION_STARTED)
+    session.language = "hi-IN"
+    machine.fire(session, Event.LANGUAGE_CHOSEN)
+    assert session.state is State.CONSENT
+    return session
+
+
+def test_refusing_consent_is_kept_apart_from_giving_up(machine: Machine):
+    """Three ways to leave the consent gate, and they are not the same event.
+
+    Folded together, "the notice is badly worded" and "the form is too long"
+    and "they went quiet" all look like one number going up, and the number
+    tells you nothing about which to fix. The success metric is
+    first-transaction completion, so every exit has to be attributable.
+    """
+    refused = _at_consent(machine, Session(session_id="refused"))
+    machine.fire(refused, Event.CONSENT_REFUSED)
+
+    quit_out = _at_consent(machine, Session(session_id="quit"))
+    machine.fire(quit_out, Event.USER_QUIT)
+
+    timed_out = _at_consent(machine, Session(session_id="timeout"))
+    machine.fire(timed_out, Event.SESSION_TIMEOUT)
+
+    assert refused.state is State.CONSENT_REFUSED
+    assert refused.state is not State.ABANDONED, "a refusal is not an abandonment"
+
+    # Still conflated, deliberately and separately: walking away and going
+    # quiet both land in ABANDONED. Splitting those is the same argument again
+    # and has not been made yet -- this test records that it is still true
+    # rather than letting it pass unnoticed.
+    assert quit_out.state is State.ABANDONED
+    assert timed_out.state is State.ABANDONED
+
+
+def test_a_refusal_is_answered_without_escalating_to_a_human():
+    """The bug this split actually fixes.
+
+    While a refusal landed in ABANDONED it inherited HANDING_TO_HUMAN, so
+    somebody who said "do not process my data" was answered with "let me get
+    someone for you" -- an escalation triggered by the word no. Nothing in the
+    state machine was wrong; the phrasing map was reading a state that meant
+    three different things.
+    """
+    from app.conversation import STATE_SPEECH
+    from app.llm.speech_acts import SPEECH_ACTS, SpeechActKind
+
+    kind = STATE_SPEECH[State.CONSENT_REFUSED]
+
+    assert kind is not SpeechActKind.HANDING_TO_HUMAN
+    assert kind is SpeechActKind.ACKNOWLEDGE_NO_CONSENT
+
+    # The wording is the model's job, but the fallback ships with the code and
+    # is what a caller hears when the API is unreachable -- so it is worth
+    # pinning that it accepts the answer rather than reopening the question.
+    spoken = SPEECH_ACTS[kind].fallback.lower()
+    assert "start again" in spoken, "leave the door open"
+    for pressure in ("why", "are you sure", "instead"):
+        assert pressure not in spoken, f"the fallback pushes back with {pressure!r}"
+
+
+def test_refusing_consent_is_terminal(machine: Machine):
+    """No consent, no processing -- including no way back in through an event."""
+    session = _at_consent(machine, Session(session_id="terminal"))
+    machine.fire(session, Event.CONSENT_REFUSED)
+
+    assert session.state in TERMINAL_STATES
+    for event in Event:
+        with pytest.raises(IllegalTransitionError):
+            machine.fire(session, event)
+    assert session.state is State.CONSENT_REFUSED
+
+
+def test_nothing_personal_was_collected_before_the_refusal(machine: Machine):
+    """Why this edge needs no erasure step.
+
+    Consent gates ELIGIBILITY and COLLECT_DATA, so a refusal happens before
+    any question that collects personal data. If that ordering ever changed,
+    the transition would start stranding data belonging to someone who
+    explicitly refused -- so the ordering is asserted, not assumed.
+    """
+    session = _at_consent(machine, Session(session_id="clean"))
+    machine.fire(session, Event.CONSENT_REFUSED)
+
+    assert session.applicant == {}
+    assert session.eligibility_input is None
+    assert session.eligibility is None
+    assert session.account_number is None
+
+
+def test_the_refusal_is_written_down(machine: Machine, audit: InMemoryAuditSink):
+    """A lawful stop still has to be provable afterwards."""
+    session = _at_consent(machine, Session(session_id="recorded"))
+    machine.fire(session, Event.CONSENT_REFUSED)
+
+    (last,) = [
+        record
+        for record in audit.for_session("recorded")
+        if record.kind is AuditKind.TRANSITION_ACCEPTED
+        and record.to_state == str(State.CONSENT_REFUSED)
+    ]
+    assert last.from_state == str(State.CONSENT)
+    assert last.event == str(Event.CONSENT_REFUSED)

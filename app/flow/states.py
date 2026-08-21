@@ -54,12 +54,22 @@ class State(StrEnum):
     # Terminal states. Nothing transitions out of these.
     COMPLETED = "COMPLETED"
     DECLINED = "DECLINED"
+    # The bank said no (DECLINED) and the person said no (CONSENT_REFUSED) are
+    # different outcomes and are kept apart. So is "stopped answering"
+    # (ABANDONED) -- see the note on the CONSENT_REFUSED transition below.
+    CONSENT_REFUSED = "CONSENT_REFUSED"
     ABANDONED = "ABANDONED"
     HUMAN_HANDOFF = "HUMAN_HANDOFF"
 
 
 TERMINAL_STATES: frozenset[State] = frozenset(
-    {State.COMPLETED, State.DECLINED, State.ABANDONED, State.HUMAN_HANDOFF}
+    {
+        State.COMPLETED,
+        State.DECLINED,
+        State.CONSENT_REFUSED,
+        State.ABANDONED,
+        State.HUMAN_HANDOFF,
+    }
 )
 
 
@@ -168,8 +178,28 @@ TRANSITIONS: dict[tuple[State, Event], tuple[Transition, ...]] = {
     (State.CONSENT, Event.CONSENT_GIVEN): (
         Transition(State.ELIGIBILITY, why="Consent recorded; screening may begin."),
     ),
+    # Its own terminal state, not ABANDONED. Three reasons, and the third is
+    # the one that actually changes behaviour:
+    #
+    #   1. Measurement. The success metric is first-transaction completion, so
+    #      every exit has to be attributable. Folded into ABANDONED, "people
+    #      refuse the consent notice" is indistinguishable from "people give up
+    #      mid-form" and from "people go quiet", and those need different
+    #      fixes -- rewrite the notice, shorten the form, handle silence.
+    #   2. Law. A refusal is a lawful stop with a decision behind it. Walking
+    #      away is the absence of a decision. Only one of them is an answer.
+    #   3. What we say next. ABANDONED is phrased as HANDING_TO_HUMAN, so
+    #      routing a refusal here meant answering "do not process my data" with
+    #      "let me get someone for you" -- escalating at exactly the moment
+    #      somebody has said no. That is the bug this fixes.
+    #
+    # Nothing needs erasing on this edge: consent gates ELIGIBILITY and
+    # COLLECT_DATA, so no personal data has been collected yet.
     (State.CONSENT, Event.CONSENT_REFUSED): (
-        Transition(State.ABANDONED, why="No consent, no processing. A clean, lawful stop."),
+        Transition(
+            State.CONSENT_REFUSED,
+            why="No consent, no processing. A clean, lawful stop.",
+        ),
     ),
 
     # -- ELIGIBILITY ---------------------------------------------------------
@@ -356,6 +386,7 @@ STATE_TOOLS: dict[State, frozenset[ToolName]] = {
 
     State.COMPLETED: frozenset(),
     State.DECLINED: frozenset(),
+    State.CONSENT_REFUSED: frozenset(),
     State.ABANDONED: frozenset(),
     State.HUMAN_HANDOFF: frozenset(),
 }
