@@ -387,6 +387,11 @@ STATE_SPEECH: Mapping[State, SpeechActKind] = {
     State.COMPLETED: SpeechActKind.CONFIRM_COMPLETED,
     State.DECLINED: SpeechActKind.ANNOUNCE_DECLINE,
     State.CONSENT_REFUSED: SpeechActKind.ACKNOWLEDGE_NO_CONSENT,
-    State.ABANDONED: SpeechActKind.HANDING_TO_HUMAN,
+    # Was HANDING_TO_HUMAN, which answered "stop" by escalating to a person
+    # and promising they already had the applicant's details -- the same bug
+    # CONSENT_REFUSED had, for the same reason: one state meaning several
+    # things, and only one phrasing available for it.
+    State.ABANDONED: SpeechActKind.ACKNOWLEDGE_STOPPED,
+    State.TIMED_OUT: SpeechActKind.ANNOUNCE_TIMED_OUT,
     State.HUMAN_HANDOFF: SpeechActKind.HANDING_TO_HUMAN,
 }

@@ -58,7 +58,19 @@ class State(StrEnum):
     # different outcomes and are kept apart. So is "stopped answering"
     # (ABANDONED) -- see the note on the CONSENT_REFUSED transition below.
     CONSENT_REFUSED = "CONSENT_REFUSED"
+    # Two ways to not finish, and they are not the same thing.
+    #
+    #   ABANDONED  they said stop. A decision, and an answer.
+    #   TIMED_OUT  they stopped answering. The absence of a decision, and
+    #              often the absence of a person -- a dead battery, a train
+    #              tunnel, a child needing something.
+    #
+    # Folded together, "the form is too long" and "the network here is bad"
+    # are one number, and that number cannot tell you which to fix. They are
+    # also not equally recoverable: somebody who quit chose to, somebody who
+    # went quiet may well be trying to get back.
     ABANDONED = "ABANDONED"
+    TIMED_OUT = "TIMED_OUT"
     HUMAN_HANDOFF = "HUMAN_HANDOFF"
 
 
@@ -68,6 +80,7 @@ TERMINAL_STATES: frozenset[State] = frozenset(
         State.DECLINED,
         State.CONSENT_REFUSED,
         State.ABANDONED,
+        State.TIMED_OUT,
         State.HUMAN_HANDOFF,
     }
 )
@@ -332,16 +345,19 @@ TRANSITIONS: dict[tuple[State, Event], tuple[Transition, ...]] = {
     (State.FUNDING, Event.USER_QUIT): (Transition(State.ABANDONED),),
     (State.FIRST_TRANSACTION, Event.USER_QUIT): (Transition(State.ABANDONED),),
 
-    # Timeouts. KYC_PENDING is excluded -- see the note in that section.
-    (State.START, Event.SESSION_TIMEOUT): (Transition(State.ABANDONED),),
-    (State.LANGUAGE_SELECT, Event.SESSION_TIMEOUT): (Transition(State.ABANDONED),),
-    (State.CONSENT, Event.SESSION_TIMEOUT): (Transition(State.ABANDONED),),
-    (State.ELIGIBILITY, Event.SESSION_TIMEOUT): (Transition(State.ABANDONED),),
-    (State.COLLECT_DATA, Event.SESSION_TIMEOUT): (Transition(State.ABANDONED),),
-    (State.KYC_HANDOFF, Event.SESSION_TIMEOUT): (Transition(State.ABANDONED),),
-    (State.ACCOUNT_CREATE, Event.SESSION_TIMEOUT): (Transition(State.ABANDONED),),
-    (State.FUNDING, Event.SESSION_TIMEOUT): (Transition(State.ABANDONED),),
-    (State.FIRST_TRANSACTION, Event.SESSION_TIMEOUT): (Transition(State.ABANDONED),),
+    # Timeouts land in TIMED_OUT, not ABANDONED. Silence is not a decision,
+    # and counting it as one hides the difference between a form people give
+    # up on and a network people lose. KYC_PENDING is excluded entirely -- see
+    # the note in that section; waiting hours there is the expected case.
+    (State.START, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
+    (State.LANGUAGE_SELECT, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
+    (State.CONSENT, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
+    (State.ELIGIBILITY, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
+    (State.COLLECT_DATA, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
+    (State.KYC_HANDOFF, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
+    (State.ACCOUNT_CREATE, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
+    (State.FUNDING, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
+    (State.FIRST_TRANSACTION, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
 }
 
 
@@ -388,5 +404,6 @@ STATE_TOOLS: dict[State, frozenset[ToolName]] = {
     State.DECLINED: frozenset(),
     State.CONSENT_REFUSED: frozenset(),
     State.ABANDONED: frozenset(),
+    State.TIMED_OUT: frozenset(),
     State.HUMAN_HANDOFF: frozenset(),
 }

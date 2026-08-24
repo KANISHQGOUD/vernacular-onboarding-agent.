@@ -255,12 +255,17 @@ def _at_consent(machine: Machine, session: Session) -> Session:
 
 
 def test_refusing_consent_is_kept_apart_from_giving_up(machine: Machine):
-    """Three ways to leave the consent gate, and they are not the same event.
+    """Three ways to leave the consent gate, and they are three events.
 
     Folded together, "the notice is badly worded" and "the form is too long"
-    and "they went quiet" all look like one number going up, and the number
-    tells you nothing about which to fix. The success metric is
-    first-transaction completion, so every exit has to be attributable.
+    and "the network here is bad" all look like one number going up, and that
+    number cannot tell you which to fix -- rewrite the notice, shorten the
+    form, or handle silence. The success metric is first-transaction
+    completion, so every exit has to be attributable.
+
+    They are also not equally recoverable, which is the part that matters for
+    what happens next: somebody who refused said no, somebody who quit chose
+    to stop, and somebody who went quiet may be trying to get back in.
     """
     refused = _at_consent(machine, Session(session_id="refused"))
     machine.fire(refused, Event.CONSENT_REFUSED)
@@ -271,15 +276,14 @@ def test_refusing_consent_is_kept_apart_from_giving_up(machine: Machine):
     timed_out = _at_consent(machine, Session(session_id="timeout"))
     machine.fire(timed_out, Event.SESSION_TIMEOUT)
 
-    assert refused.state is State.CONSENT_REFUSED
-    assert refused.state is not State.ABANDONED, "a refusal is not an abandonment"
+    assert refused.state is State.CONSENT_REFUSED, "a refusal is an answer"
+    assert quit_out.state is State.ABANDONED, "quitting is a decision to stop"
+    assert timed_out.state is State.TIMED_OUT, "silence is not a decision"
 
-    # Still conflated, deliberately and separately: walking away and going
-    # quiet both land in ABANDONED. Splitting those is the same argument again
-    # and has not been made yet -- this test records that it is still true
-    # rather than letting it pass unnoticed.
-    assert quit_out.state is State.ABANDONED
-    assert timed_out.state is State.ABANDONED
+    # The property, rather than three separate facts: no two ways of not
+    # finishing may share a state. Written this way so that adding a fourth
+    # exit and quietly pointing it at an existing one fails here.
+    assert len({refused.state, quit_out.state, timed_out.state}) == 3
 
 
 def test_a_refusal_is_answered_without_escalating_to_a_human():
@@ -350,3 +354,68 @@ def test_the_refusal_is_written_down(machine: Machine, audit: InMemoryAuditSink)
     ]
     assert last.from_state == str(State.CONSENT)
     assert last.event == str(Event.CONSENT_REFUSED)
+
+
+def test_going_quiet_is_not_answered_as_though_someone_were_listening():
+    """The second instance of the bug CONSENT_REFUSED had.
+
+    ABANDONED was phrased as HANDING_TO_HUMAN, so asking to stop was answered
+    by escalating to a person and promising they already had your details.
+    Quitting and timing out both inherited it. Each now says something true of
+    its own situation, and neither escalates.
+    """
+    from app.conversation import STATE_SPEECH
+    from app.llm.speech_acts import SPEECH_ACTS, SpeechActKind
+
+    stopped = STATE_SPEECH[State.ABANDONED]
+    lapsed = STATE_SPEECH[State.TIMED_OUT]
+
+    assert stopped is not SpeechActKind.HANDING_TO_HUMAN
+    assert lapsed is not SpeechActKind.HANDING_TO_HUMAN
+    assert stopped is not lapsed, "the whole point is that they differ"
+
+    # Quitting is legal from FUNDING and FIRST_TRANSACTION, where the account
+    # already exists -- so neither fallback may claim nothing was submitted.
+    for kind in (stopped, lapsed):
+        spoken = SPEECH_ACTS[kind].fallback.lower()
+        assert "saved" in spoken
+        assert "nothing has been" not in spoken
+
+
+def test_kyc_pending_still_cannot_time_out(machine: Machine, session: Session):
+    """The deliberate omission, re-pinned now that timeouts route elsewhere.
+
+    A video KYC handoff can take hours. A timeout here would end applications
+    belonging to people who did nothing wrong except wait, which is why there
+    is no such row -- and retargeting nine timeout rows is exactly the kind of
+    edit that would quietly add a tenth.
+    """
+    _walk_to_kyc_pending(machine, session)
+    assert session.state is State.KYC_PENDING
+
+    with pytest.raises(IllegalTransitionError):
+        machine.fire(session, Event.SESSION_TIMEOUT)
+
+    assert session.state is State.KYC_PENDING
+
+    # But a person who says they are done still gets to be done.
+    machine.fire(session, Event.USER_QUIT)
+    assert session.state is State.ABANDONED
+
+
+def test_every_way_of_not_finishing_has_its_own_state():
+    """A funnel is only readable if the exits are distinguishable.
+
+    COMPLETED is the one success. Everything else is a different reason, and
+    each needs its own bucket or the breakdown collapses back into "didn't
+    finish", which is the number we already had and could not act on.
+    """
+    exits = {
+        State.COMPLETED,
+        State.DECLINED,
+        State.CONSENT_REFUSED,
+        State.ABANDONED,
+        State.TIMED_OUT,
+        State.HUMAN_HANDOFF,
+    }
+    assert exits == set(TERMINAL_STATES)
