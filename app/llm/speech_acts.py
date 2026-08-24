@@ -56,7 +56,6 @@ class SpeechActKind(StrEnum):
     CONFIRM_COMPLETED = "CONFIRM_COMPLETED"
     ACKNOWLEDGE_NO_CONSENT = "ACKNOWLEDGE_NO_CONSENT"
     ACKNOWLEDGE_STOPPED = "ACKNOWLEDGE_STOPPED"
-    ANNOUNCE_TIMED_OUT = "ANNOUNCE_TIMED_OUT"
     HANDING_TO_HUMAN = "HANDING_TO_HUMAN"
     DID_NOT_UNDERSTAND = "DID_NOT_UNDERSTAND"
 
@@ -130,19 +129,6 @@ SPEECH_ACTS: Mapping[SpeechActKind, SpeechActSpec] = MappingProxyType(
                 fallback=(
                     "Alright, we'll stop here. Whatever you've finished so far "
                     "is saved."
-                ),
-            ),
-            SpeechActSpec(
-                kind=SpeechActKind.ANNOUNCE_TIMED_OUT,
-                intent=(
-                    "There has been no answer for a while, so you are stopping. "
-                    "Say so plainly and say their progress is saved. Do not "
-                    "scold them for the silence and do not ask where they went "
-                    "-- most likely nobody is listening to this."
-                ),
-                fallback=(
-                    "I haven't heard anything for a while, so I'll stop here. "
-                    "Whatever you've finished so far is saved."
                 ),
             ),
             SpeechActSpec(

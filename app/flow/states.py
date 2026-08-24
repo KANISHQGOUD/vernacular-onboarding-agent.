@@ -58,19 +58,11 @@ class State(StrEnum):
     # different outcomes and are kept apart. So is "stopped answering"
     # (ABANDONED) -- see the note on the CONSENT_REFUSED transition below.
     CONSENT_REFUSED = "CONSENT_REFUSED"
-    # Two ways to not finish, and they are not the same thing.
+    # They said stop. A decision, and an answer.
     #
-    #   ABANDONED  they said stop. A decision, and an answer.
-    #   TIMED_OUT  they stopped answering. The absence of a decision, and
-    #              often the absence of a person -- a dead battery, a train
-    #              tunnel, a child needing something.
-    #
-    # Folded together, "the form is too long" and "the network here is bad"
-    # are one number, and that number cannot tell you which to fix. They are
-    # also not equally recoverable: somebody who quit chose to, somebody who
-    # went quiet may well be trying to get back.
+    # Note what is NOT here: a state for going quiet. Silence is not an
+    # outcome, so it does not get one -- see the note on lapsing below.
     ABANDONED = "ABANDONED"
-    TIMED_OUT = "TIMED_OUT"
     HUMAN_HANDOFF = "HUMAN_HANDOFF"
 
 
@@ -80,10 +72,35 @@ TERMINAL_STATES: frozenset[State] = frozenset(
         State.DECLINED,
         State.CONSENT_REFUSED,
         State.ABANDONED,
-        State.TIMED_OUT,
         State.HUMAN_HANDOFF,
     }
 )
+
+# LAPSING IS NOT A TRANSITION
+# ---------------------------
+# Going quiet used to fire SESSION_TIMEOUT into a TIMED_OUT state. Both are
+# gone, and the reason is worth keeping.
+#
+# Making that state resumable means going back to where the session was, and a
+# transition targets a constant -- so "go back" becomes one guarded edge per
+# state a timeout can happen in. Nine of them, and they are new entrances into
+# ELIGIBILITY, COLLECT_DATA and ACCOUNT_CREATE, each of which is asserted to
+# have exactly one. The guard would keep it behaviourally safe while turning
+# "illegal is absent from the table" into "illegal unless a guard says
+# otherwise". In a flow where one of those entrances opens a bank account,
+# that is the wrong thing to trade for convenience.
+#
+# So a lapse does not move the session at all. Somebody who stops answering in
+# COLLECT_DATA is still in COLLECT_DATA -- they are simply not talking -- and
+# coming back needs no edge, because they never left. Zero new entrances, and
+# all three regulatory walls stay structural.
+#
+# It also stops overstating what a timeout knows. The state machine cannot
+# tell a person who gave up from one whose train went into a tunnel, and this
+# product's callers are disproportionately the second. `Actions.record_lapse`
+# writes the fact to the audit trail, where an operational question belongs,
+# and `session.lapses` counts it -- which is more than the old state carried,
+# because it survives the resume and says WHERE people go quiet.
 
 
 class Event(StrEnum):
@@ -116,7 +133,6 @@ class Event(StrEnum):
     ACCOUNT_CREATION_FAILED = "ACCOUNT_CREATION_FAILED"
     DEPOSIT_CONFIRMED = "DEPOSIT_CONFIRMED"
     PAYMENT_CONFIRMED = "PAYMENT_CONFIRMED"
-    SESSION_TIMEOUT = "SESSION_TIMEOUT"
 
 
 class ToolName(StrEnum):
@@ -267,7 +283,9 @@ TRANSITIONS: dict[tuple[State, Event], tuple[Transition, ...]] = {
             why="Budget spent. A person takes over rather than the loop continuing.",
         ),
     ),
-    # Deliberately NO (KYC_PENDING, SESSION_TIMEOUT) row. This state can
+    # Nothing times this state out. Nothing times any state out any more --
+    # see the note on lapsing above -- but this is where that started. This
+    # state can
     # legitimately last hours -- the user closes the app and finishes video KYC
     # at a branch in the evening. Timing out here would destroy exactly the
     # journey the handoff exists to protect.
@@ -345,19 +363,6 @@ TRANSITIONS: dict[tuple[State, Event], tuple[Transition, ...]] = {
     (State.FUNDING, Event.USER_QUIT): (Transition(State.ABANDONED),),
     (State.FIRST_TRANSACTION, Event.USER_QUIT): (Transition(State.ABANDONED),),
 
-    # Timeouts land in TIMED_OUT, not ABANDONED. Silence is not a decision,
-    # and counting it as one hides the difference between a form people give
-    # up on and a network people lose. KYC_PENDING is excluded entirely -- see
-    # the note in that section; waiting hours there is the expected case.
-    (State.START, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
-    (State.LANGUAGE_SELECT, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
-    (State.CONSENT, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
-    (State.ELIGIBILITY, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
-    (State.COLLECT_DATA, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
-    (State.KYC_HANDOFF, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
-    (State.ACCOUNT_CREATE, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
-    (State.FUNDING, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
-    (State.FIRST_TRANSACTION, Event.SESSION_TIMEOUT): (Transition(State.TIMED_OUT),),
 }
 
 
@@ -404,6 +409,5 @@ STATE_TOOLS: dict[State, frozenset[ToolName]] = {
     State.DECLINED: frozenset(),
     State.CONSENT_REFUSED: frozenset(),
     State.ABANDONED: frozenset(),
-    State.TIMED_OUT: frozenset(),
     State.HUMAN_HANDOFF: frozenset(),
 }

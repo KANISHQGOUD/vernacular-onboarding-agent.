@@ -116,19 +116,28 @@ def test_completed_is_enterable_only_by_a_confirmed_payment():
     assert entrances_to(State.COMPLETED) == {(State.FIRST_TRANSACTION, Event.PAYMENT_CONFIRMED)}
 
 
-def test_kyc_pending_does_not_time_out(machine: Machine):
-    """The suspension may last hours. Timing it out would defeat the handoff."""
-    assert (State.KYC_PENDING, Event.SESSION_TIMEOUT) not in TRANSITIONS
+def test_no_state_is_ended_for_being_quiet(machine: Machine):
+    """What began as a KYC_PENDING exclusion is now the rule everywhere.
 
-    session = Session(session_id="patient", state=State.KYC_PENDING)
-    with pytest.raises(IllegalTransitionError):
-        machine.fire(session, Event.SESSION_TIMEOUT)
+    The handoff needed it first: a video KYC session may take hours, and
+    timing it out would defeat the whole point of suspending. Making that
+    exclusion universal turned out to be the only way to have lapses be
+    recoverable at all -- resuming a state you moved OUT of means an edge back
+    IN to it, and those edges are what the entrance tests above exist to keep
+    singular.
 
-    # Every other live state does time out -- this exclusion is specific.
-    for state in State:
-        if state in TERMINAL_STATES or state is State.KYC_PENDING:
-            continue
-        assert (state, Event.SESSION_TIMEOUT) in TRANSITIONS
+    So there is no timeout event to exclude KYC_PENDING from. Nothing in the
+    map ends a session for silence, which is checked here by name rather than
+    by listing states, so a future `IDLE_TIMEOUT` cannot slip in beside it.
+    """
+    assert not hasattr(Event, "SESSION_TIMEOUT"), "lapsing must not be an event"
+
+    for name in dir(Event):
+        assert "TIMEOUT" not in name.upper(), f"{name} looks like a timeout event"
+
+    for origin, event in TRANSITIONS:
+        assert "TIMEOUT" not in str(event).upper()
+        assert "TIMED" not in str(origin).upper()
 
 
 # ---------------------------------------------------------------------------

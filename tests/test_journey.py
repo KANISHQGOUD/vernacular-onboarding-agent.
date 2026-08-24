@@ -8,6 +8,10 @@ from app.audit import AuditKind, InMemoryAuditSink
 from app.flow.eligibility import evaluate
 from app.flow.machine import IllegalTransitionError, Machine
 from app.flow.states import MAX_KYC_ATTEMPTS, TERMINAL_STATES, Event, State
+from app.flow.actions import Actions
+from app.providers.core_banking import MockCoreBanking
+from app.providers.kyc import MockKycProvider
+from app.providers.payments import MockPaymentRail
 from app.session import InMemorySessionStore, Session
 from tests.conftest import complete_applicant_data, eligible_applicant
 
@@ -273,17 +277,18 @@ def test_refusing_consent_is_kept_apart_from_giving_up(machine: Machine):
     quit_out = _at_consent(machine, Session(session_id="quit"))
     machine.fire(quit_out, Event.USER_QUIT)
 
-    timed_out = _at_consent(machine, Session(session_id="timeout"))
-    machine.fire(timed_out, Event.SESSION_TIMEOUT)
-
     assert refused.state is State.CONSENT_REFUSED, "a refusal is an answer"
     assert quit_out.state is State.ABANDONED, "quitting is a decision to stop"
-    assert timed_out.state is State.TIMED_OUT, "silence is not a decision"
 
-    # The property, rather than three separate facts: no two ways of not
-    # finishing may share a state. Written this way so that adding a fourth
-    # exit and quietly pointing it at an existing one fails here.
-    assert len({refused.state, quit_out.state, timed_out.state}) == 3
+    # No two ways of finishing may share a state. Written as a property so
+    # that adding a third and quietly pointing it at an existing one fails.
+    assert len({refused.state, quit_out.state}) == 2
+
+    # And the third way of not finishing is not an ending at all: going quiet
+    # leaves the session exactly where it was, waiting. See the lapse tests.
+    lapsed = _at_consent(machine, Session(session_id="quiet"))
+    _actions(machine).record_lapse(lapsed)
+    assert lapsed.state is State.CONSENT, "silence moved the session"
 
 
 def test_a_refusal_is_answered_without_escalating_to_a_human():
@@ -356,47 +361,44 @@ def test_the_refusal_is_written_down(machine: Machine, audit: InMemoryAuditSink)
     assert last.event == str(Event.CONSENT_REFUSED)
 
 
-def test_going_quiet_is_not_answered_as_though_someone_were_listening():
+def test_asking_to_stop_is_not_answered_with_an_escalation():
     """The second instance of the bug CONSENT_REFUSED had.
 
     ABANDONED was phrased as HANDING_TO_HUMAN, so asking to stop was answered
     by escalating to a person and promising they already had your details.
-    Quitting and timing out both inherited it. Each now says something true of
-    its own situation, and neither escalates.
     """
     from app.conversation import STATE_SPEECH
     from app.llm.speech_acts import SPEECH_ACTS, SpeechActKind
 
     stopped = STATE_SPEECH[State.ABANDONED]
-    lapsed = STATE_SPEECH[State.TIMED_OUT]
-
     assert stopped is not SpeechActKind.HANDING_TO_HUMAN
-    assert lapsed is not SpeechActKind.HANDING_TO_HUMAN
-    assert stopped is not lapsed, "the whole point is that they differ"
 
     # Quitting is legal from FUNDING and FIRST_TRANSACTION, where the account
-    # already exists -- so neither fallback may claim nothing was submitted.
-    for kind in (stopped, lapsed):
-        spoken = SPEECH_ACTS[kind].fallback.lower()
-        assert "saved" in spoken
-        assert "nothing has been" not in spoken
+    # already exists -- so the fallback may not claim nothing was submitted.
+    spoken = SPEECH_ACTS[stopped].fallback.lower()
+    assert "saved" in spoken
+    assert "nothing has been" not in spoken
+
+    # And there is no act for going quiet, because there is no moment to say
+    # it in: nobody is listening when it happens, and by the time they are
+    # back the answer is whatever the state they are still in asks.
+    assert not hasattr(SpeechActKind, "ANNOUNCE_TIMED_OUT")
 
 
-def test_kyc_pending_still_cannot_time_out(machine: Machine, session: Session):
-    """The deliberate omission, re-pinned now that timeouts route elsewhere.
+def test_waiting_at_the_handoff_costs_nothing(machine: Machine, session: Session):
+    """The deliberate omission that became the general rule.
 
-    A video KYC handoff can take hours. A timeout here would end applications
-    belonging to people who did nothing wrong except wait, which is why there
-    is no such row -- and retargeting nine timeout rows is exactly the kind of
-    edit that would quietly add a tenth.
+    A video KYC handoff can take hours. Ending it for silence would punish
+    people who did nothing but wait -- and once lapsing stopped being a
+    transition, that became true of every state, not just this one.
     """
     _walk_to_kyc_pending(machine, session)
-    assert session.state is State.KYC_PENDING
 
-    with pytest.raises(IllegalTransitionError):
-        machine.fire(session, Event.SESSION_TIMEOUT)
+    for _ in range(3):
+        _actions(machine).record_lapse(session)
 
-    assert session.state is State.KYC_PENDING
+    assert session.state is State.KYC_PENDING, "waiting cost them their place"
+    assert session.lapses == 3
 
     # But a person who says they are done still gets to be done.
     machine.fire(session, Event.USER_QUIT)
@@ -415,7 +417,101 @@ def test_every_way_of_not_finishing_has_its_own_state():
         State.DECLINED,
         State.CONSENT_REFUSED,
         State.ABANDONED,
-        State.TIMED_OUT,
         State.HUMAN_HANDOFF,
     }
     assert exits == set(TERMINAL_STATES)
+
+    # Going quiet is deliberately absent: it is not a way of finishing, it is
+    # a pause. Counting it as an outcome was the bug.
+    for state in TERMINAL_STATES:
+        assert "TIMED" not in str(state).upper()
+
+
+# ---------------------------------------------------------------------------
+# Lapsing. Not an ending, so not a transition.
+# ---------------------------------------------------------------------------
+
+
+def _actions(machine: Machine) -> Actions:
+    return Actions(
+        machine=machine,
+        kyc=MockKycProvider(),
+        core_banking=MockCoreBanking(),
+        payments=MockPaymentRail(),
+    )
+
+
+def test_going_quiet_leaves_the_session_exactly_where_it_was(machine: Machine):
+    """The whole design, in one assertion.
+
+    They stopped answering halfway through the form. They are still halfway
+    through the form. Resuming needs no edge back into COLLECT_DATA, which is
+    what keeps every entrance in the map singular.
+    """
+    session = _at_consent(machine, Session(session_id="quiet"))
+    machine.fire(session, Event.CONSENT_GIVEN)
+    session.eligibility = evaluate(eligible_applicant())
+    machine.fire(session, Event.ELIGIBILITY_CHECKED)
+    assert session.state is State.COLLECT_DATA
+
+    _actions(machine).record_lapse(session)
+
+    assert session.state is State.COLLECT_DATA
+    assert session.lapses == 1
+    assert session.has_lapsed
+
+    # And they can carry straight on, because nothing was undone.
+    session.applicant = complete_applicant_data()
+    machine.fire(session, Event.REQUIRED_DATA_COMPLETE)
+    assert session.state is State.KYC_HANDOFF
+
+
+def test_a_lapse_is_written_down_without_claiming_a_transition(
+    machine: Machine, audit: InMemoryAuditSink
+):
+    """It is a real event and belongs in the trail -- as itself.
+
+    Recording it as TRANSITION_ACCEPTED would put a move in the audit log that
+    never happened, which is exactly the kind of thing the trail exists to be
+    trusted about.
+    """
+    session = _at_consent(machine, Session(session_id="recorded"))
+    actions = _actions(machine)
+    actions.record_lapse(session)
+    actions.record_return(session)
+
+    trail = audit.for_session("recorded")
+    kinds = [record.kind for record in trail]
+
+    assert AuditKind.SESSION_LAPSED in kinds
+    assert AuditKind.SESSION_RETURNED in kinds
+
+    for record in trail:
+        if record.kind in (AuditKind.SESSION_LAPSED, AuditKind.SESSION_RETURNED):
+            assert record.from_state == record.to_state, "a lapse claimed a move"
+
+
+def test_the_machine_refuses_to_forge_a_transition_record(machine: Machine):
+    """`record` is the only way to write a non-transition fact, and it is
+    narrow on purpose: if anything could write TRANSITION_ACCEPTED, the trail
+    would record what callers claimed rather than what the machine did."""
+    session = Session(session_id="forge", state=State.CONSENT)
+
+    for kind in (AuditKind.TRANSITION_ACCEPTED, AuditKind.TRANSITION_REFUSED):
+        with pytest.raises(ValueError, match="fire"):
+            machine.record(session, kind, detail="did not happen")
+
+
+def test_lapses_survive_erasure(machine: Machine):
+    """Operational metadata, not personal data -- which is why it lives in
+    `notes`. A bank still has to be able to answer "how often did this
+    application get interrupted" after it can no longer answer "whose"."""
+    session = _at_consent(machine, Session(session_id="erased"))
+    session.applicant = {"full_name": "Asha Devi"}
+    _actions(machine).record_lapse(session)
+
+    session.erase_personal_data()
+
+    assert session.applicant == {}
+    assert session.lapses == 1
+    assert session.notes["lapsed_in"] == str(State.CONSENT)

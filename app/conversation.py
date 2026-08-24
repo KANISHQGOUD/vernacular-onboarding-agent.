@@ -392,6 +392,5 @@ STATE_SPEECH: Mapping[State, SpeechActKind] = {
     # CONSENT_REFUSED had, for the same reason: one state meaning several
     # things, and only one phrasing available for it.
     State.ABANDONED: SpeechActKind.ACKNOWLEDGE_STOPPED,
-    State.TIMED_OUT: SpeechActKind.ANNOUNCE_TIMED_OUT,
     State.HUMAN_HANDOFF: SpeechActKind.HANDING_TO_HUMAN,
 }

@@ -29,6 +29,12 @@ class AuditKind(StrEnum):
     TOOL_ALLOWED = "TOOL_ALLOWED"
     TOOL_REFUSED = "TOOL_REFUSED"
     ELIGIBILITY_DECIDED = "ELIGIBILITY_DECIDED"
+    # Somebody stopped answering, and later started again. Neither moves the
+    # session, so neither is a TRANSITION_ACCEPTED -- but "this application
+    # was interrupted four times" is exactly the kind of thing the trail
+    # exists to be able to answer afterwards.
+    SESSION_LAPSED = "SESSION_LAPSED"
+    SESSION_RETURNED = "SESSION_RETURNED"
 
 
 @dataclass(frozen=True, slots=True)

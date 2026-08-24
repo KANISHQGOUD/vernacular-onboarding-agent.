@@ -149,6 +149,38 @@ class Machine:
             tool=str(tool),
         )
 
+    def record(
+        self,
+        session: Session,
+        kind: AuditKind,
+        *,
+        detail: str = "",
+    ) -> None:
+        """Write a fact that did not move the session.
+
+        Lapsing and returning are real and worth auditing, and neither is a
+        transition. Without this they would have to reach `_audit` directly,
+        and a sink that anything can write to is a sink where a
+        TRANSITION_ACCEPTED can appear with no transition behind it -- which
+        would make the trail a record of what callers claimed rather than of
+        what the machine did.
+
+        So the transition kinds are refused here. `fire` is the only thing
+        that may say a session moved.
+        """
+        if kind in (AuditKind.TRANSITION_ACCEPTED, AuditKind.TRANSITION_REFUSED):
+            raise ValueError(
+                f"{kind} may only be written by fire(); this session did not move"
+            )
+
+        self._audit.append(
+            session.session_id,
+            kind,
+            from_state=str(session.state),
+            to_state=str(session.state),
+            detail=detail,
+        )
+
     def fire(self, session: Session, event: Event) -> Session:
         """Apply an event. Moves the session or raises; never silently does nothing.
 

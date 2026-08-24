@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from app.flow.eligibility import EligibilityInput, Residency, evaluate
+from app.audit import AuditKind
 from app.flow.machine import Machine
 from app.flow.states import Event, ToolName
 from app.providers.core_banking import CoreBankingProvider
@@ -94,6 +95,42 @@ class Actions:
 
         if session.required_data_complete:
             return self.machine.fire(session, Event.REQUIRED_DATA_COMPLETE)
+        return session
+
+    def record_lapse(self, session: Session) -> Session:
+        """Nobody has said anything for a while.
+
+        Note what this does NOT do: fire an event. The session does not move.
+        Somebody who stops answering in COLLECT_DATA is still in COLLECT_DATA,
+        and coming back needs no transition because they never left.
+
+        That is not a shortcut. Resuming a state you moved OUT of means a way
+        back IN to it, and the way back in to ACCOUNT_CREATE is the one thing
+        this whole design exists to keep singular.
+        """
+        session.notes["lapses"] = str(session.lapses + 1)
+        session.notes["lapsed_in"] = str(session.state)
+        self.machine.record(
+            session,
+            AuditKind.SESSION_LAPSED,
+            detail=f"no answer; lapse {session.lapses}",
+        )
+        return session
+
+    def record_return(self, session: Session) -> Session:
+        """They came back. There is nothing to undo.
+
+        The conversation layer re-runs whatever the current state requires, so
+        a returning caller is asked the question they were already on. A
+        session reloaded from storage does not know it was ever away -- which
+        is the same sentence `Conversation.resume` was written under, for the
+        video KYC handoff, before there was anything else to resume.
+        """
+        self.machine.record(
+            session,
+            AuditKind.SESSION_RETURNED,
+            detail=f"back after lapse {session.lapses}",
+        )
         return session
 
     def escalate_to_human(self, session: Session, reason: str) -> Session:

@@ -73,6 +73,24 @@ class Session:
         return self.eligibility is not None and self.eligibility.passed
 
     @property
+    def lapses(self) -> int:
+        """How many times this session went quiet and came back.
+
+        Lives in `notes`, not as a field of its own, because it is operational
+        metadata about the conversation rather than anything about the person
+        -- so it survives `erase_personal_data()`, which is the whole reason
+        that split exists.
+        """
+        try:
+            return int(self.notes.get("lapses", "0"))
+        except ValueError:
+            return 0
+
+    @property
+    def has_lapsed(self) -> bool:
+        return self.lapses > 0
+
+    @property
     def required_data_complete(self) -> bool:
         return REQUIRED_APPLICANT_FIELDS.issubset(self.applicant.keys())
 
