@@ -264,6 +264,30 @@ class Conversation:
             understood=understood,
         )
 
+    def misheard(self, session: Session) -> Reply:
+        """A turn we are not confident enough to act on.
+
+        Deliberately never reaches the classifier. Handing a transcript we
+        already doubt to a model buys a confident reading of a guess -- the
+        model has no way to know the audio was unclear, so it will resolve the
+        ambiguity in whichever direction the wording leans, and return an
+        intent with no hint that any of it was uncertain. It also spends one
+        request from a twenty-a-day quota to do that.
+
+        Asking them to repeat themselves costs nothing and is what a person
+        would do.
+        """
+        act = SpeechAct(
+            kind=SpeechActKind.DID_NOT_UNDERSTAND,
+            language=session.language or DEFAULT_LANGUAGE,
+        )
+        return Reply(
+            text=self.phraser.say(act),
+            state=session.state,
+            moved=False,
+            understood=False,
+        )
+
     def _speech_for(self, session: Session) -> SpeechAct:
         kind = STATE_SPEECH.get(session.state, SpeechActKind.DID_NOT_UNDERSTAND)
         language = session.language or DEFAULT_LANGUAGE

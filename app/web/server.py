@@ -54,9 +54,11 @@ from app.audit import AuditKind, InMemoryAuditSink
 from app.conversation import Conversation
 from app.flow.actions import Actions
 from app.flow.machine import Machine
+from app.flow.hearing import is_confident_enough
 from app.flow.states import TERMINAL_STATES, State
 from app.llm.classifier import GeminiIntentClassifier, OfflineClassifier
 from app.llm.client import LlmClient, api_key_available
+from app.languages import DEFAULT_LANGUAGE
 from app.llm.phrasing import Phraser
 from app.providers.core_banking import MockCoreBanking
 from app.providers.kyc import MockKycProvider
@@ -240,6 +242,22 @@ def create_app(
                     await socket.send_json({"error": "session is finished"})
                     continue
 
+                # How sure the recogniser was, when there was one. Typed input
+                # sends nothing and is treated as certain, which is correct --
+                # nobody mishears a keyboard.
+                #
+                # Client-reported, and therefore advisory rather than a
+                # security control: this page could always claim 1.0, exactly
+                # as it could always type the same words. It is a quality
+                # signal from our own front end, not a check on an adversary.
+                # Under a server-side topology the number would come from our
+                # provider instead and could be trusted properly.
+                if not is_confident_enough(_confidence(message), loaded.state):
+                    reply = conversation.misheard(loaded)
+                    registry.save(loaded)
+                    await socket.send_json(_payload(reply, loaded))
+                    continue
+
                 try:
                     reply = conversation.respond(loaded, utterance)
                 except Exception:
@@ -269,6 +287,24 @@ def create_app(
     return app
 
 
+def _confidence(message) -> float | None:
+    """Pull a usable confidence out of whatever the client sent.
+
+    Anything that is not a real number in 0..1 becomes None, which
+    `is_confident_enough` treats as "not reported" and lets through. A
+    malformed field must not silently become a low score and lock somebody out
+    of their own application -- the failure has to fall towards letting the
+    turn proceed, because the alternative is an applicant who cannot speak.
+    """
+    raw = (message or {}).get("confidence")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    if value != value or not 0.0 <= value <= 1.0:  # NaN or out of range
+        return None
+    return value
+
+
 def _payload(reply, session) -> dict:
     return {
         "text": reply.text,
@@ -276,6 +312,9 @@ def _payload(reply, session) -> dict:
         "moved": reply.moved,
         "understood": reply.understood,
         "finished": session.state in TERMINAL_STATES,
+        # So the page knows which voice to speak the reply in. The machine
+        # picks the language; the browser does not get to guess it.
+        "language": session.language or DEFAULT_LANGUAGE,
     }
 
 

@@ -15,7 +15,7 @@ from app.audit import InMemoryAuditSink
 from app.conversation import Conversation
 from app.flow.actions import Actions
 from app.flow.machine import Machine
-from app.flow.states import State
+from app.flow.states import Event, State
 from app.llm.classifier import OfflineClassifier
 from app.llm.phrasing import Phraser
 from app.providers.core_banking import MockCoreBanking
@@ -24,7 +24,7 @@ from app.providers.payments import MockPaymentRail
 from app.web.registry import SessionRegistry
 from app.web.server import MAX_UTTERANCE_LENGTH, create_app
 from tests.conftest import AS_OF
-from tests.test_conversation import FULL_JOURNEY, FakeReader
+from tests.test_conversation import FULL_JOURNEY, Classification, FakeReader
 
 
 def build_client(*readings, kyc_outcomes=None):
@@ -355,3 +355,121 @@ def test_an_exploding_turn_does_not_drop_the_socket():
 
     assert "error" in first
     assert "error" in second
+
+
+# ---------------------------------------------------------------------------
+# Speech confidence. A recogniser that is guessing must not reach the model.
+# ---------------------------------------------------------------------------
+
+
+def _at_consent(client, created):
+    """Open the socket and take one turn, which lands the session on CONSENT."""
+    socket = client.websocket_connect(socket_url(created)).__enter__()
+    socket.receive_json()
+    socket.send_json({"utterance": "hindi", "confidence": 0.99})
+    assert socket.receive_json()["state"] == str(State.CONSENT)
+    return socket
+
+
+def test_a_mumbled_yes_at_the_consent_gate_never_reaches_the_classifier():
+    """The reading stays queued, which is how we know it was not consulted.
+
+    FakeReader hands out one classification per call. If the low-confidence
+    turn had reached it, CONSENT_GIVEN would be spent and the clear turn that
+    follows would find an empty queue. Instead the mumble is answered with a
+    re-prompt and the reading survives to be used by the turn that deserves it.
+
+    This is also why the check sits before the call rather than after: a
+    transcript we already doubt cannot be improved by asking a model about it,
+    and asking costs one request out of twenty a day.
+    """
+    client, _ = build_client(
+        Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"),
+        Classification(Event.CONSENT_GIVEN),
+    )
+    created = open_session(client)
+    socket = _at_consent(client, created)
+
+    socket.send_json({"utterance": "haan", "confidence": 0.4})
+    mumbled = socket.receive_json()
+
+    assert mumbled["understood"] is False
+    assert mumbled["moved"] is False
+    assert mumbled["state"] == str(State.CONSENT), "consent was recorded from a guess"
+
+    # Said clearly this time, the identical words are acted on.
+    socket.send_json({"utterance": "haan", "confidence": 0.95})
+    clear = socket.receive_json()
+
+    assert clear["moved"] is True
+    assert clear["state"] != str(State.CONSENT)
+
+
+def test_the_same_confidence_is_accepted_while_collecting_a_name():
+    """0.4 is a mumble at the consent gate and perfectly usable for a name.
+
+    Demanding certainty on names would punish exactly the accents and unusual
+    names this product exists to serve, and a wrong name is read back and
+    corrected anyway.
+    """
+    client, _ = build_client(
+        Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"),
+        Classification(Event.CONSENT_GIVEN),
+        Classification(Event.DATA_PROVIDED, "full_name", "Asha Devi"),
+    )
+    created = open_session(client)
+    socket = _at_consent(client, created)
+
+    socket.send_json({"utterance": "haan", "confidence": 0.95})
+    socket.receive_json()
+
+    socket.send_json({"utterance": "Asha Devi", "confidence": 0.4})
+    reply = socket.receive_json()
+
+    assert reply["understood"] is True, "0.4 should be good enough for a name"
+
+
+def test_typed_input_carries_no_confidence_and_is_treated_as_certain():
+    """Nobody mishears a keyboard, and the existing text path must not break."""
+    client, _ = build_client(
+        Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"),
+        Classification(Event.CONSENT_GIVEN),
+    )
+    created = open_session(client)
+    socket = _at_consent(client, created)
+
+    socket.send_json({"utterance": "haan"})  # no confidence field at all
+    assert socket.receive_json()["moved"] is True
+
+
+@pytest.mark.parametrize("value", ["high", None, True, float("nan"), 87.0, -1, [0.9]])
+def test_a_malformed_confidence_does_not_lock_anyone_out(value):
+    """Junk becomes "not reported", never a low score.
+
+    The failure has to fall towards letting the turn proceed. A client bug that
+    silently became a permanent low score would leave an applicant repeating
+    themselves at a machine that never accepts anything, which is worse than
+    the protection is worth.
+    """
+    client, _ = build_client(
+        Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"),
+        Classification(Event.CONSENT_GIVEN),
+    )
+    created = open_session(client)
+    socket = _at_consent(client, created)
+
+    socket.send_json({"utterance": "haan", "confidence": value})
+    assert socket.receive_json()["moved"] is True
+
+
+def test_the_page_is_told_which_language_to_speak_in():
+    """The machine picks the language; the browser does not get to guess it."""
+    client, _ = build_client(Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"))
+    created = open_session(client)
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        opening = socket.receive_json()
+        assert "language" in opening
+
+        socket.send_json({"utterance": "hindi", "confidence": 0.99})
+        assert socket.receive_json()["language"] == "hi-IN"

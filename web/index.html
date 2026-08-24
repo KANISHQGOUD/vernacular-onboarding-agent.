@@ -57,6 +57,10 @@
     padding: 0 20px; border-radius: 8px; cursor: pointer;
   }
   button:disabled { opacity: .4; cursor: not-allowed; }
+  button.listening { background: #b3261e; color: #fff; border-color: #b3261e; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
+  button.listening { animation: pulse 1.1s ease-in-out infinite; }
+  label.toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; opacity: .8; }
 </style>
 </head>
 <body>
@@ -80,6 +84,8 @@
 <footer>
   <input id="input" placeholder="Type what a caller would say…" autocomplete="off" maxlength="500" disabled>
   <button id="send" disabled>Send</button>
+  <button id="mic" disabled title="Hold a conversation out loud">&#127908; Speak</button>
+  <label class="toggle"><input type="checkbox" id="tts" checked> speak replies</label>
   <button id="retry" hidden>Reconnect</button>
 </footer>
 
@@ -91,6 +97,8 @@ const statusEl = document.getElementById("status");
 const input = document.getElementById("input");
 const send = document.getElementById("send");
 const retry = document.getElementById("retry");
+const mic = document.getElementById("mic");
+const tts = document.getElementById("tts");
 
 let socket = null;
 let credentials = null;
@@ -102,6 +110,109 @@ let needsNewSession = false;
 // silently retried forever.
 const MAX_ATTEMPTS = 6;
 const MAX_BACKOFF_MS = 10000;
+
+// ---------------------------------------------------------------------------
+// Speech, in the browser.
+//
+// The server never receives audio. The recogniser runs here, and what crosses
+// the socket is text plus how sure the recogniser was -- which is the one
+// thing a text-only channel throws away. Speech recognition does not fail
+// loudly: it returns a plausible sentence with no error, so "nahi" heard as
+// "haan" at the consent gate would look exactly like a consent. The number is
+// the only warning anyone gets, so it travels with the words.
+//
+// Free, no API key, and nothing to install. The trade is that it is Chrome,
+// Edge and Safari only, quality on Indic speech is whatever the browser
+// vendor's model manages, and the audio goes to their servers -- which is
+// fine for a demo and not something a bank could ship.
+// ---------------------------------------------------------------------------
+const Recogniser = window.SpeechRecognition || window.webkitSpeechRecognition;
+const canListen = Boolean(Recogniser);
+const canSpeak = "speechSynthesis" in window;
+
+let recognition = null;
+let listening = false;
+// The machine chooses the language and tells us. The browser never guesses it:
+// re-detecting per utterance would let one mumbled sentence switch somebody
+// into a language they cannot read.
+let language = "en-IN";
+
+function voiceFor(code) {
+  const voices = window.speechSynthesis.getVoices() || [];
+  return voices.find(v => v.lang === code)
+      || voices.find(v => v.lang && v.lang.replace("_", "-") === code)
+      || voices.find(v => v.lang && v.lang.split(/[-_]/)[0] === code.split("-")[0])
+      || null;
+}
+
+function speak(text) {
+  if (!canSpeak || !tts.checked || !text) return;
+  // Never queue. If a new reply has arrived the previous one is stale, and a
+  // backlog of sentences talking over each other is how voice demos die.
+  window.speechSynthesis.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = language;
+  const voice = voiceFor(language);
+  if (voice) utterance.voice = voice;
+  else if (language !== "en-IN") {
+    note(`No installed voice for ${language} — the reply will be read in the default voice.`);
+  }
+  window.speechSynthesis.speak(utterance);
+}
+
+function note(text) {
+  bubble("note", text);
+}
+
+function startListening() {
+  if (!canListen || listening) return;
+
+  // Stop talking before listening, or the microphone hears the agent and
+  // transcribes the agent's own sentence back to the server.
+  if (canSpeak) window.speechSynthesis.cancel();
+
+  recognition = new Recogniser();
+  recognition.lang = language;
+  recognition.interimResults = false;   // no partials until VAD arrives
+  recognition.continuous = false;       // one utterance per press
+  recognition.maxAlternatives = 1;
+
+  recognition.onstart = () => {
+    listening = true;
+    mic.classList.add("listening");
+    mic.innerHTML = "&#9632; Listening…";
+  };
+
+  recognition.onend = () => {
+    listening = false;
+    mic.classList.remove("listening");
+    mic.innerHTML = "&#127908; Speak";
+  };
+
+  recognition.onerror = (event) => {
+    if (event.error === "no-speech") { note("Didn't hear anything."); return; }
+    if (event.error === "not-allowed") {
+      note("Microphone blocked. Allow it in the address bar to speak.");
+      mic.disabled = true;
+      return;
+    }
+    note("Microphone error: " + event.error);
+  };
+
+  recognition.onresult = (event) => {
+    const best = event.results[0][0];
+    // Chrome reports 0 for some results rather than omitting the field. A
+    // real zero and "not measured" are different things, and sending 0 would
+    // block every turn, so an absent or zero score travels as null -- the
+    // server treats null as unreported and lets the turn through.
+    const raw = best.confidence;
+    const confidence = (typeof raw === "number" && raw > 0) ? raw : null;
+    sendUtterance(best.transcript, confidence);
+  };
+
+  recognition.start();
+}
 
 function bubble(who, text, meta) {
   const wrap = document.createElement("div");
@@ -146,6 +257,8 @@ function setLive(live, label) {
   statusEl.textContent = label;
   input.disabled = !live;
   send.disabled = !live;
+  mic.disabled = !live || !canListen;
+  if (!live && canSpeak) window.speechSynthesis.cancel();
   if (live) input.focus();
 }
 
@@ -178,8 +291,12 @@ function connect() {
       ? `<span class="moved">moved</span> to ${data.state}`
       : `<span class="stuck">stayed</span> in ${data.state}`;
     const understood = data.understood ? "" : " &middot; not understood";
+    // The machine decides the language; we follow it. It can change mid-call
+    // when somebody asks to switch, and the voice has to follow with it.
+    if (data.language) language = data.language;
     bubble("agent", data.text, movement + understood);
     recordState(data.state, data.moved);
+    speak(data.text);
 
     if (data.finished) {
       setLive(false, "session finished");
@@ -226,12 +343,25 @@ function connect() {
   };
 }
 
-function submit() {
-  const text = input.value.trim();
-  if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
-  bubble("you", text);
-  socket.send(JSON.stringify({ utterance: text }));
+function sendUtterance(text, confidence) {
+  const trimmed = (text || "").trim();
+  if (!trimmed || !socket || socket.readyState !== WebSocket.OPEN) return;
+
+  const spoken = typeof confidence === "number";
+  bubble("you", trimmed, spoken
+    ? `heard &middot; confidence ${confidence.toFixed(2)}`
+    : "typed");
+
+  const message = { utterance: trimmed };
+  // Omitted entirely when typed. Nobody mishears a keyboard, and the server
+  // treats a missing field as certain rather than as zero.
+  if (spoken) message.confidence = confidence;
+  socket.send(JSON.stringify(message));
   input.value = "";
+}
+
+function submit() {
+  sendUtterance(input.value, null);
 }
 
 retry.addEventListener("click", () => {
@@ -256,6 +386,26 @@ retry.addEventListener("click", () => {
 
 send.addEventListener("click", submit);
 input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+
+mic.addEventListener("click", () => {
+  if (listening) { recognition.stop(); return; }
+  startListening();
+});
+
+tts.addEventListener("change", () => {
+  if (!tts.checked && canSpeak) window.speechSynthesis.cancel();
+});
+
+if (!canListen) {
+  mic.title = "This browser has no speech recognition — Chrome, Edge or Safari do";
+}
+
+// getVoices() is empty until the list loads, so a first reply can arrive
+// before any voice exists. Touching it here primes the list.
+if (canSpeak) {
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+}
 
 start();
 </script>
