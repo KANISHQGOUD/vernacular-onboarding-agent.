@@ -129,14 +129,19 @@ def build_storage() -> tuple[SessionRegistry, object]:
         PostgresAuditSink,
         PostgresSessionStore,
         PostgresTokenStore,
+        open_pool,
     )
 
     log.info("using Postgres for sessions and the audit trail")
+    # One pool, shared by all three stores. Three pools would triple the idle
+    # connections for no benefit -- they are backed by the same database and
+    # a connection does not care which store borrowed it.
+    pool = open_pool(url)
     registry = SessionRegistry(
-        store=PostgresSessionStore(url),
-        tokens=PostgresTokenStore(url),
+        store=PostgresSessionStore(pool),
+        tokens=PostgresTokenStore(pool),
     )
-    return registry, PostgresAuditSink(url)
+    return registry, PostgresAuditSink(pool)
 
 
 def create_app(

@@ -61,25 +61,41 @@ def schema():
     return DATABASE_URL
 
 
+@pytest.fixture(scope="module")
+def pool(schema):
+    """One pool for the module, closed at the end.
+
+    Module-scoped because building a pool opens real connections, and a
+    per-test pool would put back most of the setup cost this change exists to
+    remove. Closed on teardown: `ConnectionPool` runs worker threads, and
+    leaking one per test module is how a suite ends up hanging at exit.
+    """
+    from app.store.postgres import open_pool
+
+    created = open_pool(schema, name="tests")
+    yield created
+    created.close()
+
+
 @pytest.fixture
-def store(schema):
+def store(pool):
     from app.store.postgres import PostgresSessionStore
 
-    return PostgresSessionStore(schema)
+    return PostgresSessionStore(pool)
 
 
 @pytest.fixture
-def sink(schema):
+def sink(pool):
     from app.store.postgres import PostgresAuditSink
 
-    return PostgresAuditSink(schema)
+    return PostgresAuditSink(pool)
 
 
 @pytest.fixture
-def tokens(schema):
+def tokens(pool):
     from app.store.postgres import PostgresTokenStore
 
-    return PostgresTokenStore(schema)
+    return PostgresTokenStore(pool)
 
 
 def fresh_id() -> str:
@@ -291,30 +307,43 @@ def test_a_session_survives_a_process_restart(schema):
     invalidate every live session, which for anyone parked at the regulatory
     handoff meant losing an application designed to last hours.
     """
-    from app.store.postgres import PostgresSessionStore, PostgresTokenStore
+    from app.store.postgres import PostgresSessionStore, PostgresTokenStore, open_pool
+
+    # A pool each, not a shared one. The point of the test is that nothing but
+    # the database carries the session across, and a shared pool would be a
+    # second thing both "processes" have in common.
+    pools = []
 
     def new_process() -> SessionRegistry:
+        created = open_pool(schema, min_size=1, max_size=2)
+        pools.append(created)
         return SessionRegistry(
-            store=PostgresSessionStore(schema),
-            tokens=PostgresTokenStore(schema),
+            store=PostgresSessionStore(created),
+            tokens=PostgresTokenStore(created),
         )
 
-    before = new_process()
-    session, token = before.create()
-    session.state = State.KYC_PENDING
-    session.language = "hi-IN"
-    session.kyc_reference = "vckyc-xyz"
-    before.save(session)
+    try:
+        before = new_process()
+        session, token = before.create()
+        session.state = State.KYC_PENDING
+        session.language = "hi-IN"
+        session.kyc_reference = "vckyc-xyz"
+        before.save(session)
 
-    del before  # the process ends here
+        pools.pop().close()  # the process ends here, connections and all
+        del before
 
-    after = new_process()
-    recovered = after.open(session.session_id, token)
+        after = new_process()
+        recovered = after.open(session.session_id, token)
+    finally:
+        for leftover in pools:
+            leftover.close()
 
     assert recovered is not None
     assert recovered.state is State.KYC_PENDING
     assert recovered.language == "hi-IN"
     assert recovered.kyc_reference == "vckyc-xyz"
+
 
 
 # ---------------------------------------------------------------------------
@@ -603,3 +632,68 @@ def test_the_audit_trail_never_held_the_person_to_begin_with(store, sink):
     )
     for name, value in _applicant_with_everything().items():
         assert value not in written, f"{name} reached the audit trail"
+
+
+# ---------------------------------------------------------------------------
+# Pooling. A borrowed connection has to go back in the state it came out in.
+# ---------------------------------------------------------------------------
+
+
+def test_a_pooled_connection_goes_back_without_locks_or_an_open_transaction(sink, pool, schema):
+    """The failure pooling introduces, which no functional test would catch.
+
+    Every assertion here would still pass on a broken implementation if it
+    were checked through the pool, so it is checked from a connection outside
+    it.
+
+    Two ways this goes wrong, both silent:
+
+      `pg_advisory_lock` instead of `pg_advisory_xact_lock` -- session-scoped,
+      so the lock survives the return to the pool and poisons that connection
+      for whoever borrows it next. The symptom is a deadlock that moves
+      between unrelated sessions and vanishes on restart.
+
+      A transaction left open -- the connection sits "idle in transaction",
+      holding its locks and blocking VACUUM on the whole table for as long as
+      the pool keeps it, which is forever.
+    """
+    session_id = fresh_id()
+    for index in range(5):
+        sink.append(session_id, AuditKind.TRANSITION_ACCEPTED, detail=f"event {index}")
+    assert len(sink.for_session(session_id)) == 5
+
+    with psycopg.connect(schema) as watcher:
+        advisory = watcher.execute(
+            """
+            SELECT count(*) FROM pg_locks
+            WHERE locktype = 'advisory'
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+            """
+        ).fetchone()[0]
+        idle_in_transaction = watcher.execute(
+            """
+            SELECT count(*) FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND state = 'idle in transaction'
+            """
+        ).fetchone()[0]
+
+    assert advisory == 0, "an advisory lock outlived its transaction"
+    assert idle_in_transaction == 0, "a pooled connection was left mid-transaction"
+
+
+def test_connections_are_returned_rather_than_accumulated(store, sink, pool):
+    """Borrow far more times than the pool is big, and it must not grow."""
+    from app.store.postgres import POOL_MAX_SIZE
+
+    session_id = fresh_id()
+    for index in range(40):
+        store.save(Session(session_id=session_id, state=State.COLLECT_DATA))
+        store.load(session_id)
+        sink.append(session_id, AuditKind.TOOL_ALLOWED, detail=f"borrow {index}")
+
+    stats = pool.get_stats()
+    assert stats["pool_size"] <= POOL_MAX_SIZE
+    assert stats.get("requests_waiting", 0) == 0
+    # Everything handed out came back.
+    assert stats["pool_available"] == stats["pool_size"]

@@ -18,6 +18,30 @@ rested on the sink having no update method, which stops accidents and stops
 nothing else. In Postgres a trigger rejects UPDATE and DELETE for every role
 including the owner, so the claim survives contact with a psql prompt.
 
+ONE CONNECTION PER CALL WAS 87% OF THE COST
+-------------------------------------------
+Measured against this container before changing anything: a connect-and-close
+costs about 15 ms at the median and 34 ms at p90, while the statements
+themselves run in one to three. A voice turn touches storage three times --
+load the session, append to the trail, save the session -- so roughly 46 ms of
+every 52 ms turn was spent opening sockets and authenticating, and then
+throwing the result away.
+
+So the stores now share a pool. Connections are made once and handed out,
+which is the whole change.
+
+WHY THE ADVISORY LOCK HAD TO BE TRANSACTION-SCOPED
+--------------------------------------------------
+Pooling is where that decision stops being stylistic. A pooled connection is
+handed to the next caller with whatever state the last one left on it, and
+`pg_advisory_lock` is session-scoped -- it would have survived the return to
+the pool and poisoned that connection for everyone who borrowed it afterwards,
+producing a deadlock that moves between sessions and disappears on restart.
+
+`pg_advisory_xact_lock` is released by the commit, so a connection always goes
+back clean. The original choice was right for a reason that only becomes
+visible here.
+
 CONCURRENCY, HONESTLY
 ---------------------
 Audit sequences are per-session and gapless, which is a claim two writers can
@@ -54,6 +78,7 @@ from typing import Any
 import psycopg
 from psycopg import errors as pg_errors
 from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
 
 from app.audit import AuditEvent, AuditKind
 from app.session import Session
@@ -67,6 +92,45 @@ SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 # enough to out-wait other writers -- which is the assumption that made the
 # previous version drop events.
 SEQUENCE_ATTEMPTS = 5
+
+# Small on purpose. Contention is per session and a session carries one
+# conversation, so concurrency here is the number of callers talking at once,
+# not a query-per-row workload. Borrowers above `max_size` wait rather than
+# fail, which is the correct answer for a load this shape.
+POOL_MIN_SIZE = 2
+POOL_MAX_SIZE = 10
+
+
+def open_pool(
+    conninfo: str,
+    *,
+    min_size: int = POOL_MIN_SIZE,
+    max_size: int = POOL_MAX_SIZE,
+    name: str = "onboarding",
+) -> ConnectionPool:
+    """Create the pool the three stores share.
+
+    `open=True` is passed explicitly because the implicit open in the
+    constructor is deprecated, and a DeprecationWarning surfacing from a
+    storage layer during someone else's test run is a bad way to find out.
+
+    `autocommit=False`, uniformly. Every `pool.connection()` block is then
+    exactly one transaction -- committed when the block exits cleanly, rolled
+    back if it raises -- which replaces the old per-method mix of autocommit
+    True and False with one rule that reads the same everywhere.
+
+    The caller owns the pool and should close it. Nothing here closes it for
+    you, because a storage layer that decides when the process is finished
+    with its connections is a storage layer that will do it at the wrong time.
+    """
+    return ConnectionPool(
+        conninfo,
+        min_size=min_size,
+        max_size=max_size,
+        kwargs={"autocommit": False},
+        name=name,
+        open=True,
+    )
 
 
 def apply_schema(conninfo: str) -> None:
@@ -86,11 +150,11 @@ class PostgresSessionStore:
     the dataclass, and the two would drift.
     """
 
-    conninfo: str
+    pool: ConnectionPool
 
     def save(self, session: Session) -> None:
         data = session.to_dict()
-        with psycopg.connect(self.conninfo, autocommit=True) as connection:
+        with self.pool.connection() as connection:
             connection.execute(
                 """
                 INSERT INTO sessions (session_id, state, data)
@@ -103,7 +167,7 @@ class PostgresSessionStore:
             )
 
     def load(self, session_id: str) -> Session | None:
-        with psycopg.connect(self.conninfo) as connection:
+        with self.pool.connection() as connection:
             row = connection.execute(
                 "SELECT data FROM sessions WHERE session_id = %s",
                 (session_id,),
@@ -121,7 +185,7 @@ class PostgresSessionStore:
         The one query worth an index. Everything else about a session is
         answered by loading it.
         """
-        with psycopg.connect(self.conninfo) as connection:
+        with self.pool.connection() as connection:
             rows = connection.execute(
                 "SELECT session_id FROM sessions WHERE state = %s ORDER BY updated_at",
                 ("KYC_PENDING",),
@@ -138,10 +202,10 @@ class PostgresTokenStore:
     might end up in a slow-query log.
     """
 
-    conninfo: str
+    pool: ConnectionPool
 
     def put(self, session_id: str, token_sha256: str) -> None:
-        with psycopg.connect(self.conninfo, autocommit=True) as connection:
+        with self.pool.connection() as connection:
             connection.execute(
                 """
                 INSERT INTO session_tokens (session_id, token_sha256)
@@ -153,7 +217,7 @@ class PostgresTokenStore:
             )
 
     def get(self, session_id: str) -> str | None:
-        with psycopg.connect(self.conninfo) as connection:
+        with self.pool.connection() as connection:
             row = connection.execute(
                 "SELECT token_sha256 FROM session_tokens WHERE session_id = %s",
                 (session_id,),
@@ -161,7 +225,7 @@ class PostgresTokenStore:
         return row[0] if row else None
 
     def forget(self, session_id: str) -> None:
-        with psycopg.connect(self.conninfo, autocommit=True) as connection:
+        with self.pool.connection() as connection:
             connection.execute(
                 "DELETE FROM session_tokens WHERE session_id = %s", (session_id,)
             )
@@ -171,7 +235,7 @@ class PostgresTokenStore:
 class PostgresAuditSink:
     """Satisfies `AuditSink`. Append-only, enforced by the database."""
 
-    conninfo: str
+    pool: ConnectionPool
 
     def append(
         self,
@@ -188,48 +252,48 @@ class PostgresAuditSink:
 
         for attempt in range(SEQUENCE_ATTEMPTS):
             try:
-                # autocommit is deliberately OFF. `pg_advisory_xact_lock` is
-                # released when its transaction ends, so with autocommit on it
-                # would be dropped before the INSERT that depends on it -- the
-                # lock and the statement it protects have to be one transaction.
-                with psycopg.connect(self.conninfo) as connection:
-                    with connection.transaction():
-                        # Serialises appends to THIS session only. Different
-                        # sessions hash to different keys and never wait on each
-                        # other; a hashtext collision costs two unrelated
-                        # sessions a brief queue, never correctness, because
-                        # their primary keys differ regardless.
-                        connection.execute(
-                            "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                            (session_id,),
+                # The pool block IS the transaction: connections are handed
+                # out with autocommit off, so the lock and the INSERT it
+                # protects commit together, and that same commit releases
+                # the lock -- which is what returns the connection to the
+                # pool clean. See the note at the top of this file.
+                with self.pool.connection() as connection:
+                    # Serialises appends to THIS session only. Different
+                    # sessions hash to different keys and never wait on each
+                    # other; a hashtext collision costs two unrelated
+                    # sessions a brief queue, never correctness, because
+                    # their primary keys differ regardless.
+                    connection.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (session_id,),
+                    )
+                    row = connection.execute(
+                        """
+                        INSERT INTO audit_events (
+                            session_id, sequence, kind, recorded_at,
+                            from_state, to_state, event, tool, detail
                         )
-                        row = connection.execute(
-                            """
-                            INSERT INTO audit_events (
-                                session_id, sequence, kind, recorded_at,
-                                from_state, to_state, event, tool, detail
-                            )
-                            SELECT
-                                %(session_id)s,
-                                COALESCE(MAX(sequence) + 1, 0),
-                                %(kind)s, %(recorded_at)s,
-                                %(from_state)s, %(to_state)s,
-                                %(event)s, %(tool)s, %(detail)s
-                            FROM audit_events
-                            WHERE session_id = %(session_id)s
-                            RETURNING sequence
-                            """,
-                            {
-                                "session_id": session_id,
-                                "kind": str(kind),
-                                "recorded_at": recorded_at,
-                                "from_state": from_state,
-                                "to_state": to_state,
-                                "event": event,
-                                "tool": tool,
-                                "detail": detail,
-                            },
-                        ).fetchone()
+                        SELECT
+                            %(session_id)s,
+                            COALESCE(MAX(sequence) + 1, 0),
+                            %(kind)s, %(recorded_at)s,
+                            %(from_state)s, %(to_state)s,
+                            %(event)s, %(tool)s, %(detail)s
+                        FROM audit_events
+                        WHERE session_id = %(session_id)s
+                        RETURNING sequence
+                        """,
+                        {
+                            "session_id": session_id,
+                            "kind": str(kind),
+                            "recorded_at": recorded_at,
+                            "from_state": from_state,
+                            "to_state": to_state,
+                            "event": event,
+                            "tool": tool,
+                            "detail": detail,
+                        },
+                    ).fetchone()
 
                 return AuditEvent(
                     session_id=session_id,
@@ -266,7 +330,7 @@ class PostgresAuditSink:
         )
 
     def for_session(self, session_id: str) -> tuple[AuditEvent, ...]:
-        with psycopg.connect(self.conninfo) as connection:
+        with self.pool.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT sequence, kind, recorded_at, from_state, to_state,

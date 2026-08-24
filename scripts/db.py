@@ -44,7 +44,12 @@ def main() -> None:
     parser.add_argument("command", choices=["apply", "check", "waiting"])
     args = parser.parse_args()
 
-    from app.store.postgres import PostgresSessionStore, apply_schema, describe
+    from app.store.postgres import (
+        PostgresSessionStore,
+        apply_schema,
+        describe,
+        open_pool,
+    )
 
     url = conninfo()
 
@@ -63,7 +68,14 @@ def main() -> None:
         return
 
     if args.command == "waiting":
-        waiting = PostgresSessionStore(url).suspended_at_kyc()
+        # A one-shot script wants one connection, not a warm pool, and it has
+        # to hand it back -- an unclosed pool keeps non-daemon worker threads
+        # alive and the script never exits.
+        pool = open_pool(url, min_size=1, max_size=2)
+        try:
+            waiting = PostgresSessionStore(pool).suspended_at_kyc()
+        finally:
+            pool.close()
         if not waiting:
             print("nobody is waiting on a video call")
             return
