@@ -92,10 +92,11 @@ and spends one request from a 20/day quota.
 
 ## Current state
 
-Branch `master`, 17 commits, tree clean.
+Branch `master`, 24 commits, tree clean.
 
-**913 tests pass, 0 skipped, ~5s.** 891 of them need no network and no keys;
-22 need Postgres.
+**944 tests pass, ~6s.** 922 need no network and no keys; 22 need
+Postgres. One more is skipped by default: the live Sarvam round trip, which
+runs only under `SARVAM_LIVE=1` because it spends prepaid credit.
 
 | | count |
 |---|---|
@@ -297,9 +298,15 @@ Gating on the key being present, the way the Postgres tests gate on
   timer calls it. Needs a clock-injection decision consistent with how
   `eligibility.py` takes an explicit `as_of` rather than reading a clock.
 - **Sarvam STT/TTS**, then Silero VAD for turn-taking. Both need the key.
-- **A WER comparison** — ~10 Hindi utterances (a spoken date, a code-mixed
-  sentence, a mobile number) through Web Speech, Sarvam and IndicConformer.
-  Answers "which vendor and why" with numbers instead of opinion.
+- **The WER comparison needs recordings.** `scripts/wer.py` is built and
+  tested; it has only ever run against synthesised audio, which proves the
+  harness and nothing about accuracy. It needs real speakers.
+
+  Read the transcripts, not the aggregate. Sarvam normalises as it
+  transcribes — `एक जनवरी उन्नीस सौ नब्बे` comes back as `1 जनवरी 1990` — so
+  the first run scored 150.6% WER for an engine that misheard nothing. An
+  engine that normalises is penalised against one that does not, which means
+  a naive table recommends the worse recogniser.
 - **Caller utterances and account numbers go to Google.** Fine for a portfolio
   project; a real deployment needs a DPA and probably in-region hosting.
 - **Erasure is SQL-level, not disk-level.** Measured with pageinspect: after

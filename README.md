@@ -89,6 +89,20 @@ the *cost of acting on a mishearing*: a wrong name is read back and corrected,
 a wrong consent is caught by nobody. A strict floor on names would punish
 unusual names and heavy accents — precisely the people this is for.
 
+**The benchmark said 150% and the engine was right.** A harness was built to
+answer "which recogniser" with numbers instead of opinion. Its first run
+scored Sarvam at 150.6% word error rate — on utterances where it had misheard
+nothing at all. It normalises as it transcribes: *एक जनवरी उन्नीस सौ नब्बे*
+comes back as `1 जनवरी 1990`, *पाँच सौ रुपये* as `₹500`. Correct, useful, and
+catastrophic against a reference written the way people speak.
+
+That is worse than a confusing number. An engine that normalises is penalised
+against one that does not, so the naive table recommends the **worse**
+recogniser — while for this flow the normalising one is better, because the
+extraction step downstream wants `1990`. The report now prints every
+disagreeing transcript rather than a percentage, so nobody can quote the
+aggregate without having read them.
+
 ## Try it
 
 Requires Python 3.13 and, optionally, Docker.
@@ -105,7 +119,7 @@ py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-**931 tests, no API key and no network required.** Everything external is
+**944 tests, no API key and no network required.** Everything external is
 behind a seam with an offline implementation, which is the point.
 
 To talk to it, copy `.env.example` to `.env`, add a free
@@ -125,6 +139,57 @@ after the first time.
 Durable sessions need Postgres; see [CLAUDE.md](CLAUDE.md) for the container.
 Without it the app runs on in-memory storage and a restart drops live sessions.
 
+## Choosing a recogniser with numbers
+
+`scripts/wer.py` scores speech engines on the utterances this flow actually
+collects — a spoken date, a mobile number, an uncommon name, a code-mixed
+sentence, and the two consent answers, which are about 300 milliseconds long,
+carry few acoustic cues, and are irreversible if confused.
+
+```bash
+.venv\Scripts\python.exe scripts/wer.py template
+```
+
+That writes `corpus/manifest.jsonl`. Record each utterance as `<id>.wav` from a
+real speaker, correct each `reference` to what they actually said — people
+improvise, and the reference is the truth — then:
+
+```bash
+.venv\Scripts\python.exe scripts/wer.py run --engines sarvam
+```
+
+Both word and character error rate are reported. **CER is the headline**: word
+rate assumes spaces separate words, and Indic engines disagree about compounds
+and postpositions, so a single spacing difference can cost two substitutions
+while the characters are identical. Substitutions, deletions and insertions
+are counted separately, because they are different faults — mishearing,
+dropped audio, and hallucinating into silence — and one percentage hides which
+you have.
+
+The normalisation is written by hand rather than taken from a library, because
+the off-the-shelf ones get Indic text wrong. Punctuation is stripped **by
+Unicode category, never by keeping `isalnum()`** — that returns False for
+Devanagari vowel signs, so `आशा` becomes `आश` and every Indic word quietly
+gets shorter. Text is NFC-normalised first, Devanagari digits fold to ASCII (a
+spoken phone number may return either, and both are the same answer), and the
+danda is treated as punctuation because recognisers add it inconsistently.
+
+**The browser cannot be scripted.** `SpeechRecognition` accepts microphone
+input only and cannot be pointed at a file, so browser numbers require a
+person speaking each utterance into the page; those results import with
+`--browser results.json`. Any engine the script cannot call — a hosted demo,
+a self-hosted IndicConformer — imports the same way, so adding one needs no
+code change.
+
+`bootstrap` will synthesise placeholder clips so the harness can be exercised
+before a recording session exists. Every report it produces is stamped **not
+evidence**: a recogniser scoring well on another engine's clean synthesis says
+nothing about a person in a room with a fan running.
+
+The manifest is committed; the audio is not. A recording of somebody's voice
+is personal data, and a project that argues about DPDP compliance should not
+ship a folder of real people saying their names into a public repository.
+
 ## What is real and what is not
 
 **Real:** the state machine, the versioned eligibility rules, the append-only
@@ -139,8 +204,15 @@ the suspend/resume handoff are testable at all.
 **Not done:** nobody who is not me has used it yet. The design argues that
 activation is the bottleneck; proving that needs a drop-off study with real
 non-English-reading users, and until that exists this is a well-tested
-argument rather than a validated one. Turn-taking (voice activity detection)
-is also unbuilt, so the demo is push-to-talk.
+argument rather than a validated one.
+
+The recogniser comparison has the same shape — the harness is built and
+tested, but it has only been run against synthesised audio, which proves the
+harness and nothing about accuracy. Both gaps need recordings of real people,
+which is the honest boundary of what one developer can do alone at a desk.
+
+Turn-taking (voice activity detection) is unbuilt, so the demo is
+push-to-talk.
 
 ## Where to read next
 
