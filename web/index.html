@@ -342,6 +342,12 @@ if (new URLSearchParams(location.search).get("selftest") === "1") {
 }
 
 let detector = null;
+// What the microphone is actually doing. Readable from the console with
+// micDiag(), because "it is listening but nothing happens" is not a
+// debuggable report and this turns it into numbers.
+let micState = null;
+function micDiag() { return micState; }
+window.micDiag = micDiag;
 let turnPolicy = { silence_ms: 1000, patience_ms: 12000, barge_in: true, report_interruption: false };
 let interruptedThisTurn = false;
 
@@ -356,9 +362,33 @@ async function startDetector({ onSpeechEnd, onGaveUp }) {
   });
 
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+  // An AudioContext created after an `await` is outside the user-gesture that
+  // started it, so Chrome may hand it back SUSPENDED -- and a suspended
+  // context's analyser returns silence forever. The detector then never hears
+  // anything, never endpoints, and the microphone sits lit while nothing
+  // happens. That is exactly the bug this line fixes, and it is invisible
+  // without asking: there is no error, just zeroes.
+  if (ctx.state === "suspended") {
+    try { await ctx.resume(); } catch (e) { /* reported below */ }
+  }
+
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 512;
   ctx.createMediaStreamSource(stream).connect(analyser);
+
+  micState = {
+    context: ctx.state,
+    sampleRate: ctx.sampleRate,
+    track: (stream.getAudioTracks()[0] || {}).label || "unknown",
+    peakRms: 0,
+    floor: null,
+    framesSeen: 0,
+    voicedFrames: 0,
+  };
+  if (ctx.state !== "running") {
+    note("Audio context is " + ctx.state + " — the level meter will stay flat.");
+  }
 
   const frame = new Float32Array(analyser.fftSize);
   const startedAt = performance.now();
@@ -395,6 +425,13 @@ async function startDetector({ onSpeechEnd, onGaveUp }) {
     }
 
     const voice = isVoiced(rms, floor, sawSpeech && (now - lastVoiceAt) < 300);
+
+    if (micState) {
+      micState.framesSeen++;
+      micState.floor = floor;
+      if (rms > micState.peakRms) micState.peakRms = rms;
+      if (voice) micState.voicedFrames++;
+    }
     level.style.width = Math.min(100, (rms / (floor * ENTER_MARGIN * 2)) * 100) + "%";
     meter.classList.toggle("voice", voice);
 
@@ -439,6 +476,17 @@ async function startDetector({ onSpeechEnd, onGaveUp }) {
   raf = setInterval(tick, TICK_MS);
 }
 
+// The safety net described above. Cleared whenever the turn ends by any
+// route, so it cannot fire into a finished turn.
+let fallbackStop = null;
+
+function armFallbackStop() {
+  clearTimeout(fallbackStop);
+  fallbackStop = setTimeout(() => {
+    if (listening) { try { recognition.stop(); } catch (e) {} }
+  }, turnPolicy.silence_ms + 400);   // a beat behind the VAD, so it defers
+}
+
 function stopDetector() {
   if (detector) { detector.stop(); detector = null; }
 }
@@ -479,12 +527,27 @@ function startListening() {
 
   recognition.onend = () => {
     listening = false;
+    clearTimeout(fallbackStop);
     stopDetector();
     mic.classList.remove("listening");
     mic.innerHTML = "&#127908; Speak";
 
-    if (heardSoFar.trim()) sendUtterance(heardSoFar, bestConfidence);
-    else if (handsfree.checked) note("Didn't catch anything — say it again.");
+    if (heardSoFar.trim()) {
+      sendUtterance(heardSoFar, bestConfidence);
+    } else {
+      note("Didn't catch anything — say it again.");
+      // Distinguish "you were quiet" from "the detector is deaf". Without
+      // this they look identical from the outside, which is how a suspended
+      // audio context stays hidden.
+      if (micState && micState.framesSeen > 10 && micState.voicedFrames === 0) {
+        note(
+          `Microphone read ${micState.framesSeen} frames and heard no speech ` +
+          `(peak ${micState.peakRms.toFixed(4)}, threshold ` +
+          `${(micState.floor * ENTER_MARGIN).toFixed(4)}). ` +
+          `Run micDiag() in the console.`
+        );
+      }
+    }
   };
 
   recognition.onerror = (event) => {
@@ -497,9 +560,18 @@ function startListening() {
     note("Microphone error: " + event.error);
   };
 
-  // Accumulate finals; the turn is sent from onend, once OUR detector has
-  // decided it is over. Interim results are ignored except as proof the
-  // recogniser is still alive.
+  // Accumulate finals; the turn is normally sent from onend, once OUR
+  // detector has decided it is over.
+  //
+  // BUT the detector must not be the only thing that can end a turn. It was,
+  // and a detector that heard nothing meant nothing was ever sent -- the mic
+  // stayed lit while the recogniser was working perfectly and its words went
+  // nowhere. One component failing should degrade the experience, not remove
+  // it, which is the same rule the synthesis path already follows.
+  //
+  // So every final result arms a fallback stop. Whichever endpoint arrives
+  // first wins; if the VAD is healthy it always will, because it is watching
+  // the audio rather than waiting on a recogniser that has already decided.
   recognition.onresult = (event) => {
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const result = event.results[i];
@@ -513,6 +585,7 @@ function startListening() {
       if (typeof raw === "number" && raw > 0) {
         bestConfidence = bestConfidence === null ? raw : Math.min(bestConfidence, raw);
       }
+      armFallbackStop();
     }
   };
 
