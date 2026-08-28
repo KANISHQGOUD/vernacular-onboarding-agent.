@@ -41,6 +41,7 @@ first, before the call is billed rather than after.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from pathlib import Path
@@ -63,6 +64,7 @@ from app.llm.phrasing import Phraser
 from app.providers.core_banking import MockCoreBanking
 from app.providers.kyc import MockKycProvider
 from app.providers.payments import MockPaymentRail
+from app.speech import CachedSpeech, SarvamSpeech, SpeechProvider
 from app.web.registry import SessionRegistry
 
 # The CLI loaded this and the server did not, so uvicorn came up with no key
@@ -108,6 +110,43 @@ def build_conversation(audit: InMemoryAuditSink) -> Conversation:
     return Conversation(actions, OfflineClassifier(), Phraser(client=None))
 
 
+def build_speech() -> SpeechProvider | None:
+    """Server-side synthesis, if it has been asked for and paid for.
+
+    OFF unless SARVAM_TTS=1, and that default is about money rather than
+    taste. Sarvam credit is a one-time prepaid balance, so a server that
+    synthesised every reply the moment a key existed would spend it on
+    development runs nobody listened to. Turning it on is a decision.
+
+    THE SPLIT, AND WHY IT IS NOT ARBITRARY
+    --------------------------------------
+    Recognition stays in the browser. Synthesis comes from here. Each half
+    goes where it is actually better:
+
+        STT   the browser is free, and it REPORTS CONFIDENCE. Sarvam does not
+              -- see app/speech/sarvam.py -- and hearing.py's consent floor is
+              worthless against a provider that returns nothing to compare.
+        TTS   the browser cannot do it at all. Windows ships no Indic voices,
+              so `speechSynthesis` reads Devanagari in an English one, which
+              is unusable for the person this product exists for.
+
+    So the arrangement that is cheapest is also the one that keeps the consent
+    gate working. That is a coincidence, but a welcome one.
+    """
+    if os.getenv("SARVAM_TTS", "").strip() != "1":
+        return None
+
+    key = os.getenv("SARVAM_API_KEY", "").strip()
+    if not key:
+        log.warning("SARVAM_TTS=1 but SARVAM_API_KEY is empty -- no server-side voice")
+        return None
+
+    # Cached, always. Every fallback is a fixed literal and the consent notice
+    # is spoken in every call; paying twice for identical audio is a choice.
+    log.info("server-side speech: Sarvam, cached")
+    return CachedSpeech(inner=SarvamSpeech(api_key=key))
+
+
 def build_storage() -> tuple[SessionRegistry, object]:
     """Postgres when DATABASE_URL is set, memory otherwise.
 
@@ -148,6 +187,7 @@ def create_app(
     registry: SessionRegistry | None = None,
     conversation: Conversation | None = None,
     audit: InMemoryAuditSink | None = None,
+    speech: SpeechProvider | None = None,
 ) -> FastAPI:
     """Everything injectable, so tests never touch the network."""
     if registry is None and audit is None:
@@ -155,6 +195,7 @@ def create_app(
     audit = audit or InMemoryAuditSink()
     registry = registry or SessionRegistry()
     conversation = conversation or build_conversation(audit)
+    speech = speech if speech is not None else build_speech()
 
     app = FastAPI(title="Vernacular onboarding agent")
     app.state.registry = registry
@@ -228,7 +269,7 @@ def create_app(
             else conversation.resume(loaded)
         )
         registry.save(loaded)
-        await socket.send_json(_payload(reply, loaded))
+        await socket.send_json(_payload(reply, loaded, speech))
 
         try:
             while True:
@@ -260,7 +301,7 @@ def create_app(
                 if not is_confident_enough(_confidence(message), loaded.state):
                     reply = conversation.misheard(loaded)
                     registry.save(loaded)
-                    await socket.send_json(_payload(reply, loaded))
+                    await socket.send_json(_payload(reply, loaded, speech))
                     continue
 
                 try:
@@ -275,7 +316,7 @@ def create_app(
                     continue
 
                 registry.save(loaded)
-                await socket.send_json(_payload(reply, loaded))
+                await socket.send_json(_payload(reply, loaded, speech))
 
         except WebSocketDisconnect:
             # Not an error. The session is already saved, and the applicant can
@@ -310,7 +351,28 @@ def _confidence(message) -> float | None:
     return value
 
 
-def _payload(reply, session) -> dict:
+def _spoken(reply, session, speech: SpeechProvider | None) -> str | None:
+    """The reply as audio, base64, when there is a provider to make it.
+
+    Failure here is never fatal. If synthesis raises -- quota gone, network
+    dropped, vendor having a bad afternoon -- the turn still returns text and
+    the page falls back to the browser's own voice. An agent that goes silent
+    because a billing balance ran out has hung up on somebody halfway through
+    opening a bank account.
+    """
+    if speech is None or not reply.text:
+        return None
+
+    try:
+        audio = speech.synthesize(reply.text, session.language or DEFAULT_LANGUAGE)
+    except Exception:  # noqa: BLE001 - a vendor failure must not end the call
+        log.warning("synthesis failed; falling back to the browser voice", exc_info=True)
+        return None
+
+    return base64.b64encode(audio.data).decode("ascii")
+
+
+def _payload(reply, session, speech: SpeechProvider | None = None) -> dict:
     return {
         "text": reply.text,
         "state": str(reply.state),
@@ -320,6 +382,9 @@ def _payload(reply, session) -> dict:
         # So the page knows which voice to speak the reply in. The machine
         # picks the language; the browser does not get to guess it.
         "language": session.language or DEFAULT_LANGUAGE,
+        # Present only when server-side synthesis is on. The page prefers it
+        # and falls back to speechSynthesis when it is absent.
+        "audio": _spoken(reply, session, speech),
     }
 
 

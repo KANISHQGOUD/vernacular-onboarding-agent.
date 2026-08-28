@@ -27,7 +27,7 @@ from tests.conftest import AS_OF
 from tests.test_conversation import FULL_JOURNEY, Classification, FakeReader
 
 
-def build_client(*readings, kyc_outcomes=None):
+def build_client(*readings, kyc_outcomes=None, speech=None):
     audit = InMemoryAuditSink()
     machine = Machine(audit)
     actions = Actions(
@@ -43,7 +43,9 @@ def build_client(*readings, kyc_outcomes=None):
         as_of=AS_OF,
     )
     registry = SessionRegistry()
-    app = create_app(registry=registry, conversation=conversation, audit=audit)
+    app = create_app(
+        registry=registry, conversation=conversation, audit=audit, speech=speech
+    )
     return TestClient(app), registry
 
 
@@ -473,3 +475,71 @@ def test_the_page_is_told_which_language_to_speak_in():
 
         socket.send_json({"utterance": "hindi", "confidence": 0.99})
         assert socket.receive_json()["language"] == "hi-IN"
+
+
+# ---------------------------------------------------------------------------
+# Server-side voice. Off unless asked for, and never fatal when it fails.
+# ---------------------------------------------------------------------------
+
+
+def test_no_audio_is_sent_when_there_is_no_provider():
+    """The default. Nothing is synthesised, so nothing is spent."""
+    client, _ = build_client(Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"))
+    created = open_session(client)
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        assert socket.receive_json()["audio"] is None
+
+
+def test_the_reply_arrives_as_audio_when_a_provider_is_wired():
+    from app.speech import MockSpeech
+
+    speech = MockSpeech()
+    client, _ = build_client(
+        Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"), speech=speech
+    )
+    created = open_session(client)
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        opening = socket.receive_json()
+        assert opening["audio"], "no audio in the payload"
+
+        socket.send_json({"utterance": "hindi", "confidence": 0.99})
+        turn = socket.receive_json()
+
+    # Synthesised in the language the machine chose, not one the page guessed.
+    assert turn["language"] == "hi-IN"
+    assert ("hi-IN" in [lang for _, lang in speech.spoken])
+
+    import base64
+
+    assert base64.b64decode(turn["audio"])
+
+
+def test_a_vendor_failure_still_returns_the_turn():
+    """Quota gone, network dropped, vendor having a bad afternoon.
+
+    An agent that goes silent because a prepaid balance ran out has hung up on
+    somebody halfway through opening a bank account. The turn still returns
+    text, and the page falls back to the browser's own voice.
+    """
+
+    class Broke:
+        name = "broke"
+
+        def synthesize(self, text, language):
+            raise RuntimeError("no credit left")
+
+        def transcribe(self, audio, language):  # pragma: no cover
+            raise NotImplementedError
+
+    client, _ = build_client(
+        Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"), speech=Broke()
+    )
+    created = open_session(client)
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        opening = socket.receive_json()
+
+    assert opening["audio"] is None
+    assert opening["text"], "the reply itself was lost"

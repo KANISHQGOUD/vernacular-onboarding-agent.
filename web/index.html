@@ -132,6 +132,7 @@ const canSpeak = "speechSynthesis" in window;
 
 let recognition = null;
 let listening = false;
+let player = null;   // the <audio> playing a server-synthesised reply
 // The machine chooses the language and tells us. The browser never guesses it:
 // re-detecting per utterance would let one mumbled sentence switch somebody
 // into a language they cannot read.
@@ -145,6 +146,37 @@ function voiceFor(code) {
       || null;
 }
 
+// A reply synthesised server-side, by a vendor with actual Indic voices.
+// Preferred over speechSynthesis whenever it arrives, because the browser
+// cannot do this at all: Windows ships no Indic voices, so the local path
+// reads Devanagari in an English one.
+//
+// Returns false if it could not play, and the caller then falls back. A
+// failure here must never leave the agent silent -- someone halfway through
+// opening a bank account is owed a reply even if it is in the wrong voice.
+function playFromServer(base64Wav) {
+  if (!tts.checked) return true;          // muted on purpose, not a failure
+  try {
+    const bytes = Uint8Array.from(atob(base64Wav), c => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+
+    stopSpeaking();
+    player = new Audio(url);
+    player.onended = () => URL.revokeObjectURL(url);
+    // Autoplay policies can refuse until the page has been clicked once.
+    // Falling back to the browser voice is better than silence.
+    player.play().catch(() => note("Click anywhere once to allow audio."));
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function stopSpeaking() {
+  if (player) { player.pause(); player = null; }
+  if (canSpeak) window.speechSynthesis.cancel();
+}
+
 function speak(text) {
   if (!canSpeak || !tts.checked || !text) return;
   // Never queue. If a new reply has arrived the previous one is stale, and a
@@ -156,7 +188,8 @@ function speak(text) {
   const voice = voiceFor(language);
   if (voice) utterance.voice = voice;
   else if (language !== "en-IN") {
-    note(`No installed voice for ${language} — the reply will be read in the default voice.`);
+    note(`No installed voice for ${language} — reading it in the default voice. `
+       + `Start the server with SARVAM_TTS=1 for a real one.`);
   }
   window.speechSynthesis.speak(utterance);
 }
@@ -170,7 +203,7 @@ function startListening() {
 
   // Stop talking before listening, or the microphone hears the agent and
   // transcribes the agent's own sentence back to the server.
-  if (canSpeak) window.speechSynthesis.cancel();
+  stopSpeaking();
 
   recognition = new Recogniser();
   recognition.lang = language;
@@ -258,7 +291,7 @@ function setLive(live, label) {
   input.disabled = !live;
   send.disabled = !live;
   mic.disabled = !live || !canListen;
-  if (!live && canSpeak) window.speechSynthesis.cancel();
+  if (!live) stopSpeaking();
   if (live) input.focus();
 }
 
@@ -294,9 +327,12 @@ function connect() {
     // The machine decides the language; we follow it. It can change mid-call
     // when somebody asks to switch, and the voice has to follow with it.
     if (data.language) language = data.language;
-    bubble("agent", data.text, movement + understood);
+    const voice = data.audio ? " &middot; sarvam voice" : "";
+    bubble("agent", data.text, movement + understood + voice);
     recordState(data.state, data.moved);
-    speak(data.text);
+
+    // Server audio when it came, the browser's own voice when it did not.
+    if (!(data.audio && playFromServer(data.audio))) speak(data.text);
 
     if (data.finished) {
       setLive(false, "session finished");
@@ -393,7 +429,7 @@ mic.addEventListener("click", () => {
 });
 
 tts.addEventListener("change", () => {
-  if (!tts.checked && canSpeak) window.speechSynthesis.cancel();
+  if (!tts.checked) stopSpeaking();
 });
 
 if (!canListen) {
