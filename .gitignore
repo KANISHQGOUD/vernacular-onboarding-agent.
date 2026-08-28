@@ -21,3 +21,11 @@ desktop.ini
 
 # Synthesised audio. Regenerable, but only by paying for it again.
 .speech-cache/
+
+# Recordings for the WER comparison. The manifest IS committed; the audio is
+# not. A recording of somebody's voice is personal data, and a project that
+# argues about DPDP compliance should not ship a folder of real people saying
+# their names into a public repository. Synthesised clips are excluded for the
+# duller reason that they are regenerable and not evidence.
+corpus/*.wav
+corpus/.synthetic

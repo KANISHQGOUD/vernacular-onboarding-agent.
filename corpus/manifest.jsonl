@@ -1,0 +1,8 @@
+{"id": "consent-yes", "language": "hi-IN", "reference": "हाँ", "note": "the consent gate. ~300ms, few acoustic cues, irreversible if wrong", "audio": "consent-yes.wav"}
+{"id": "consent-no", "language": "hi-IN", "reference": "नहीं", "note": "the other half. confusing these two is the worst failure here", "audio": "consent-no.wav"}
+{"id": "date-spoken", "language": "hi-IN", "reference": "एक जनवरी उन्नीस सौ नब्बे", "note": "a date said in words, not digits", "audio": "date-spoken.wav"}
+{"id": "mobile-number", "language": "hi-IN", "reference": "९८१२३४५६७८", "note": "ten digits. transcription may come back Devanagari or ASCII", "audio": "mobile-number.wav"}
+{"id": "name-uncommon", "language": "hi-IN", "reference": "आशा देवी राठौड़", "note": "the case a strict confidence floor would punish", "audio": "name-uncommon.wav"}
+{"id": "codemix", "language": "hi-IN", "reference": "मेरा account खोलना है", "note": "Hinglish. how people actually speak, and where generic ASR fails", "audio": "codemix.wav"}
+{"id": "address", "language": "hi-IN", "reference": "चौदह गांधी मार्ग जयपुर", "note": "place names, which are mostly out-of-vocabulary", "audio": "address.wav"}
+{"id": "amount", "language": "hi-IN", "reference": "पाँच सौ रुपये", "note": "money, spoken as words", "audio": "amount.wav"}
