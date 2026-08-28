@@ -292,6 +292,18 @@ Gating on the key being present, the way the Postgres tests gate on
 
 ---
 
+## Measuring it
+
+`scripts/funnel.py` reports where people stop, from the audit trail rather
+than from `sessions.state` -- current position says nothing about the journey.
+`app/funnel.py` is the pure half and is tested against synthetic journeys, so
+the awkward cases (lapsed four times, opened an account and stopped) are
+written down rather than waited for.
+
+The headline is `dormant`: accounts opened that never made a first
+transaction. That is SBI's problem as one integer, and it is the number this
+whole design exists to move.
+
 ## Still open
 
 - **Nothing fires a lapse.** `record_lapse()` exists and is tested, but no

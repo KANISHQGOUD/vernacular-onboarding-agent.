@@ -268,6 +268,48 @@ noise. The decision logic has its own cases:
 open http://localhost:8000/?selftest=1
 ```
 
+## Measuring the thing it optimises
+
+The project argues that activation is the bottleneck and that the metric is
+first-transaction completion rate. For most of its life nothing computed that
+number, which is a comfortable position to argue from and a bad one to be in.
+
+```bash
+.venv\Scripts\python.exe scripts/funnel.py
+```
+
+```
+reached                 n   of all  lost here   median
+START                  21    100%                   -
+CONSENT                21    100%                 50s
+COLLECT_DATA           17     81%          2      54s
+KYC_PENDING            13     62%                 68s
+ACCOUNT_CREATE          7     33%          6      28s  <- worst
+COMPLETED               3     14%                 65s
+
+first-transaction completion      14%   (3/21)
+accounts opened                     7
+opened and never used               4   <- the problem being solved
+```
+
+It reads the **audit trail**, not `sessions.state`. Where somebody is now says
+nothing about the journey — a session sitting in `ABANDONED` does not tell you
+whether they gave up before consent or after their account was open, and those
+are opposite problems with opposite fixes. The trail is append-only, so a
+drop-off number cannot be quietly improved by editing history; that property
+was built for regulators and turns out to be what makes the metric
+trustworthy.
+
+Lapses are counted separately from exits, because going quiet is not an
+ending — the session waits. "They go silent while giving their address" and
+"they abandon at consent" are different findings.
+
+The worst step is chosen by **absolute** people lost, not by rate: a 50% drop
+on a step four people reached is noise, and chasing it would waste a study.
+
+This is what makes the user study a study. Ten people without it produce ten
+anecdotes; with it they produce "six of ten stopped at the KYC handoff".
+
 ## What is real and what is not
 
 **Real:** the state machine, the versioned eligibility rules, the append-only
@@ -280,9 +322,10 @@ protocols with scripted implementations, which is why the KYC retry path and
 the suspend/resume handoff are testable at all.
 
 **Not done:** nobody who is not me has used it yet. The design argues that
-activation is the bottleneck; proving that needs a drop-off study with real
+activation is the bottleneck; proving it needs a drop-off study with real
 non-English-reading users, and until that exists this is a well-tested
-argument rather than a validated one.
+argument rather than a validated one. The instrument for that study now
+exists — see above — so what is missing is the people, not the tooling.
 
 The recogniser comparison has the same shape — the harness is built and
 tested, but it has only been run against synthesised audio, which proves the
