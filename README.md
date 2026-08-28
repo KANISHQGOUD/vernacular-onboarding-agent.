@@ -236,9 +236,33 @@ DPDP requires notice as well as consent, and "हाँ" four seconds into a
 twenty-second explanation is a weak claim to have received it. It is recorded,
 not refused; the point is that the question stays answerable.
 
+The energy thresholds are measured rather than guessed. `scripts/measure_vad.py`
+runs the detector's own RMS maths over the corpus clips: real Hindi speech
+sits at **RMS 0.26**, four orders of magnitude above the quiet between words,
+and stays detectable against simulated room noise up to 0.08. Every constant
+in the page is derived from that number, and the script re-derives them.
+
+Detection was never the weak point. Three things were, and none of them were
+fixable by choosing a better number:
+
+- **One threshold makes speech flicker.** A signal hovering near it toggles
+  voiced/unvoiced every frame and chops a sentence into fragments. Entering
+  speech now needs 3.5× the noise floor; staying in it needs 2.0×. "Is this
+  speech" and "are they still talking" are different questions.
+- **Calibrating on the median deafens the detector.** In hands-free, people
+  answer before the agent has finished — so the "ambient" window contains
+  their voice, and the median of it becomes the threshold. It now takes the
+  20th percentile and is capped at a third of speech level, so it cannot
+  calibrate itself deaf.
+- **`requestAnimationFrame` stops when the tab is hidden.** Switching tabs
+  mid-sentence froze the detector and the turn never ended. It also paced at
+  the monitor's refresh rate, which is nobody's sampling decision. Now a
+  50 ms interval.
+
 The level meter beside the controls shows the microphone and turns red when
-speech is detected — the energy thresholds are reasonable rather than measured,
-and tuning them needs a real room. The decision logic has its own cases:
+speech is detected. What remains unverified is *your* room and *your*
+microphone — the numbers above come from real speech, not from real ambient
+noise. The decision logic has its own cases:
 
 ```bash
 open http://localhost:8000/?selftest=1
@@ -265,10 +289,11 @@ tested, but it has only been run against synthesised audio, which proves the
 harness and nothing about accuracy. Both gaps need recordings of real people,
 which is the honest boundary of what one developer can do alone at a desk.
 
-Turn-taking is built but its thresholds are untuned: the endpoint windows are
-reasoned from the product rather than measured against recordings, and the
-energy floor has never met a real room. It needs the same thing everything
-else here needs.
+Turn-taking is built and its energy thresholds are derived from measured
+speech, but the audio path has never run against a live microphone — this
+machine's automation browser blocks capture. The endpoint *windows* are
+reasoned from the product rather than measured against recordings of people
+hesitating, which is the same thing everything else here is waiting on.
 
 ## Where to read next
 

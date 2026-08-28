@@ -297,10 +297,18 @@ Gating on the key being present, the way the Postgres tests gate on
 - **Nothing fires a lapse.** `record_lapse()` exists and is tested, but no
   timer calls it. Needs a clock-injection decision consistent with how
   `eligibility.py` takes an explicit `as_of` rather than reading a clock.
-- **Turn-taking thresholds are untuned.** `app/flow/turn_taking.py` reasons
-  the windows from the product; the energy constants in `web/index.html`
-  (VOICE_MARGIN, MIN_THRESHOLD, MIN_SPEECH_MS) have never met a real room.
-  Watch the level meter while speaking: red only while you talk.
+- **The VAD audio path has never met a microphone.** The energy constants in
+  `web/index.html` are derived from measured speech -- run
+  `scripts/measure_vad.py`, which reports RMS 0.26 for real Hindi across the
+  corpus clips -- but the ambient half is simulated, because TTS silence is
+  digital zero rather than a room.
+
+  Check it by watching the level meter while speaking: red only while you
+  talk. Red in silence means MIN_THRESHOLD is too low for your room; never
+  red means ENTER_MARGIN is too high.
+
+  The endpoint *windows* in `app/flow/turn_taking.py` are reasoned from the
+  product, not measured against recordings of people hesitating.
 
   Silero VAD does not fit this topology and was not used -- it runs
   server-side on audio frames, and the server never receives audio because

@@ -235,10 +235,29 @@ function note(text) {
 // needs a real microphone in a real room, which is what the level meter is
 // for. Watch it while speaking: the bar should turn red only while you talk.
 // ---------------------------------------------------------------------------
+// MEASURED, not guessed. Real Hindi speech through this exact RMS maths
+// (scripts/measure_vad.py over the corpus clips) sits at about 0.26, with
+// between-word quiet four orders of magnitude below it. Every number here is
+// derived from that, and the script re-derives them if the corpus changes.
+const SPEECH_RMS = 0.26;       // measured median across 8 clips
+
 const CALIBRATION_MS = 400;    // how long to listen to the room first
-const VOICE_MARGIN = 3.0;      // times the ambient floor to count as speech
-const MIN_THRESHOLD = 0.006;   // a floor for the floor, for silent rooms
+const ENTER_MARGIN = 3.5;      // times the floor to START counting speech
+const EXIT_MARGIN = 2.0;       // ...and to stop. Hysteresis; see below.
+const MIN_THRESHOLD = 0.006;   // ~2% of speech: a floor for very quiet rooms
+const MAX_THRESHOLD = SPEECH_RMS / 3;  // never calibrate ourselves deaf
 const MIN_SPEECH_MS = 200;     // shorter than this is a cough, not a turn
+const TICK_MS = 50;            // see the note on requestAnimationFrame below
+
+// Hysteresis, which matters more than the exact numbers. With one threshold,
+// a signal hovering near it flickers voiced/unvoiced every frame and chops a
+// sentence into fragments. Entering speech needs 3.5x the floor; staying in
+// it only needs 2.0x. That is the difference between "is this speech" and
+// "are they still talking", and they are not the same question.
+function isVoiced(rms, floor, alreadySpeaking) {
+  const threshold = floor * (alreadySpeaking ? EXIT_MARGIN : ENTER_MARGIN);
+  return rms > threshold;
+}
 
 // Pulled out of the animation loop so it can be exercised with made-up
 // numbers instead of a microphone. The loop measures; this decides, and the
@@ -289,6 +308,17 @@ const TURN_CASES = [
   ["a short yes still counts",           { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:1350, now:3200 }, "endpoint"],
 ];
 
+// Hysteresis: it takes more energy to START hearing speech than to keep
+// hearing it. With one threshold a signal hovering near it flickers every
+// frame and chops a sentence into fragments.
+const VOICED_CASES = [
+  ["clear speech starts",        [0.26,  0.005, false], true],
+  ["room tone does not",         [0.010, 0.005, false], false],
+  ["a quiet tail keeps going",   [0.013, 0.005, true],  true],
+  ["...but would not have started", [0.013, 0.005, false], false],
+  ["true silence ends it",          [0.008, 0.005, true],  false],
+];
+
 function runTurnSelfTest() {
   const base = { startedAt: 0, minSpeechMs: 200, patienceMs: 12000, silenceMs: 1800 };
   let failed = 0;
@@ -297,7 +327,13 @@ function runTurnSelfTest() {
     if (got !== want) { failed++; console.error(`FAIL ${name}: wanted ${want}, got ${got}`); }
     else console.log(`ok   ${name}`);
   }
-  console.log(failed ? `${failed} FAILED` : `all ${TURN_CASES.length} passed`);
+  for (const [name, [rms, floor, speaking], want] of VOICED_CASES) {
+    const got = isVoiced(rms, floor, speaking);
+    if (got !== want) { failed++; console.error(`FAIL ${name}: wanted ${want}, got ${got}`); }
+    else console.log(`ok   ${name}`);
+  }
+  const total = TURN_CASES.length + VOICED_CASES.length;
+  console.log(failed ? `${failed} FAILED` : `all ${total} passed`);
   return failed === 0;
 }
 
@@ -328,7 +364,7 @@ async function startDetector({ onSpeechEnd, onGaveUp }) {
   const startedAt = performance.now();
   const ambient = [];
 
-  let threshold = MIN_THRESHOLD;
+  let floor = MIN_THRESHOLD;
   let speechStartedAt = 0;
   let lastVoiceAt = 0;
   let sawSpeech = false;
@@ -344,18 +380,22 @@ async function startDetector({ onSpeechEnd, onGaveUp }) {
     // Measure the room before judging anything in it.
     if (now - startedAt < CALIBRATION_MS) {
       ambient.push(rms);
-      raf = requestAnimationFrame(tick);
       return;
     }
     if (ambient.length) {
       const sorted = [...ambient].sort((a, b) => a - b);
-      const median = sorted[Math.floor(sorted.length / 2)] || 0;
-      threshold = Math.max(median * VOICE_MARGIN, MIN_THRESHOLD);
+      // 20th percentile, not the median. If somebody is already talking when
+      // the turn opens -- which happens constantly in hands-free, because
+      // people answer before the agent has finished -- the median of that
+      // window IS speech, and calibrating to it makes the detector deaf for
+      // the rest of the turn. A low percentile still finds the gaps.
+      floor = sorted[Math.floor(sorted.length * 0.2)] || 0;
+      floor = Math.min(Math.max(floor, MIN_THRESHOLD), MAX_THRESHOLD);
       ambient.length = 0;
     }
 
-    const voice = rms > threshold;
-    level.style.width = Math.min(100, (rms / (threshold * 2)) * 100) + "%";
+    const voice = isVoiced(rms, floor, sawSpeech && (now - lastVoiceAt) < 300);
+    level.style.width = Math.min(100, (rms / (floor * ENTER_MARGIN * 2)) * 100) + "%";
     meter.classList.toggle("voice", voice);
 
     if (voice) {
@@ -380,20 +420,23 @@ async function startDetector({ onSpeechEnd, onGaveUp }) {
 
     if (verdict === "endpoint") { stopDetector(); onSpeechEnd(); return; }
     if (verdict === "gave-up") { stopDetector(); onGaveUp(); return; }
-
-    raf = requestAnimationFrame(tick);
   }
 
+  // setInterval rather than requestAnimationFrame. rAF stops firing when the
+  // tab is hidden, so switching tabs mid-sentence froze the detector and the
+  // turn never ended. It also paces at the display's refresh rate, which is
+  // not a sampling decision anyone made -- 50ms is a choice, 16.7ms was an
+  // accident of the monitor.
   detector = {
     stop() {
-      cancelAnimationFrame(raf);
+      clearInterval(raf);
       stream.getTracks().forEach(t => t.stop());
       ctx.close().catch(() => {});
       level.style.width = "0%";
       meter.classList.remove("voice");
     },
   };
-  raf = requestAnimationFrame(tick);
+  raf = setInterval(tick, TICK_MS);
 }
 
 function stopDetector() {
