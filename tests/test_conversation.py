@@ -382,3 +382,128 @@ def test_asking_for_a_human_is_never_refused():
 
         assert session.state is State.HUMAN_HANDOFF, state
         assert reply.text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Our fault is not their fault.
+# ---------------------------------------------------------------------------
+
+
+class BrokenClassifier:
+    """The vendor is down. Not the caller mumbling."""
+
+    def read(self, utterance, state):
+        from app.llm.client import ModelUnavailableError
+
+        raise ModelUnavailableError("503 UNAVAILABLE")
+
+    def classify(self, utterance, state):
+        return self.read(utterance, state)
+
+
+def _broken_rig():
+    from app.audit import InMemoryAuditSink
+    from app.conversation import Conversation
+    from app.flow.actions import Actions
+    from app.flow.machine import Machine
+    from app.llm.phrasing import Phraser
+    from app.providers.core_banking import MockCoreBanking
+    from app.providers.kyc import MockKycProvider
+    from app.providers.payments import MockPaymentRail
+
+    audit = InMemoryAuditSink()
+    machine = Machine(audit)
+    actions = Actions(
+        machine=machine,
+        kyc=MockKycProvider(),
+        core_banking=MockCoreBanking(),
+        payments=MockPaymentRail(),
+    )
+    conversation = Conversation(actions, BrokenClassifier(), Phraser(client=None))
+    return conversation, audit
+
+
+def test_an_outage_is_not_answered_with_say_that_again():
+    """The bug this fixes: a 503 and a mumble produced the same sentence.
+
+    Telling somebody to speak more clearly while the fault is entirely ours is
+    unanswerable -- no amount of speaking clearly fixes a 503 -- and for an
+    applicant who already expects machines not to understand them it is the
+    exact humiliation this product exists to remove.
+    """
+    from app.llm.speech_acts import SPEECH_ACTS, SpeechActKind
+
+    conversation, _ = _broken_rig()
+    session = Session(session_id="outage", state=State.LANGUAGE_SELECT)
+
+    reply = conversation.respond(session, "hindi")
+
+    mumble = SPEECH_ACTS[SpeechActKind.DID_NOT_UNDERSTAND].fallback
+    assert reply.text != mumble, "an outage still sounds like a mumble"
+    assert reply.text == SPEECH_ACTS[SpeechActKind.ADMIT_OUR_FAULT].fallback
+
+
+def test_the_apology_does_not_ask_them_to_speak_more_clearly():
+    """The wrong instinct, written out so it cannot come back."""
+    from app.llm.speech_acts import SPEECH_ACTS, SpeechActKind
+
+    spec = SPEECH_ACTS[SpeechActKind.ADMIT_OUR_FAULT]
+    spoken = spec.fallback.lower()
+
+    assert "not you" in spoken, "it has to say whose fault it is"
+    for blame in ("clearly", "slowly", "again in a louder", "didn't catch"):
+        assert blame not in spoken, f"the apology blames them with {blame!r}"
+
+    # The instruction to the model carries the same prohibition, because the
+    # fallback is only reached when the model is unavailable -- the other
+    # times, wording is the model's job.
+    assert "not ask them to speak more clearly" in spec.intent.lower()
+
+
+def test_an_outage_moves_nothing_and_blames_nobody():
+    conversation, audit = _broken_rig()
+    session = Session(session_id="outage", state=State.LANGUAGE_SELECT)
+
+    reply = conversation.respond(session, "hindi")
+
+    assert session.state is State.LANGUAGE_SELECT
+    assert reply.moved is False
+    # NOT understood=False. That bucket means "the caller said something we
+    # could not read", and this was not about the caller at all.
+    assert reply.understood is True
+
+
+def test_an_outage_is_recorded_as_ours():
+    """Counted separately from a refusal, because "how often did our vendor
+    fail a caller" is an operational question and folding it into "not
+    understood" answers it as zero."""
+    from app.audit import AuditKind
+
+    conversation, audit = _broken_rig()
+    session = Session(session_id="outage", state=State.LANGUAGE_SELECT)
+    conversation.respond(session, "hindi")
+
+    kinds = [r.kind for r in audit.for_session("outage")]
+    assert AuditKind.PROVIDER_UNAVAILABLE in kinds
+    assert AuditKind.TRANSITION_REFUSED not in kinds
+
+
+def test_a_real_misunderstanding_still_says_say_that_again():
+    """The distinction has to cut both ways, or it is just a rename."""
+    from app.llm.speech_acts import SPEECH_ACTS, SpeechActKind
+
+    class Baffled:
+        def read(self, utterance, state):
+            return None
+
+        def classify(self, utterance, state):
+            return None
+
+    conversation, _ = _broken_rig()
+    conversation.classifier = Baffled()
+    session = Session(session_id="mumble", state=State.LANGUAGE_SELECT)
+
+    reply = conversation.respond(session, "mmmf")
+
+    assert reply.understood is False
+    assert reply.text == SPEECH_ACTS[SpeechActKind.DID_NOT_UNDERSTAND].fallback

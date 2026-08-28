@@ -78,6 +78,14 @@ from google.genai import errors, types
 
 log = logging.getLogger(__name__)
 
+
+class ModelUnavailableError(RuntimeError):
+    """The model could not be reached, or refused to answer.
+
+    Distinct from "the model answered and understood nothing", which is a
+    reading of the caller. This is a statement about us.
+    """
+
 # Overridable without editing code, because model availability on the free tier
 # moves faster than this repo does -- gemini-2.5-flash was the obvious default
 # and is already retired.
@@ -191,13 +199,22 @@ class LlmClient:
                     max_output_tokens=1024,
                 ),
             )
-        except errors.APIError as exc:
+        except errors.APIError as exc:  # noqa: PERF203 - see below
             # 429 lands here and is ORDINARY on a 5-RPM free tier, not
             # exceptional. Deliberately not retried: the API's own retry-after
             # is tens of seconds, and a caller mid-sentence will not wait.
             # "Say that again" costs one turn; a 44-second silence loses them.
+            #
+            # RAISED, not returned as None. Returning None made a vendor
+            # outage indistinguishable from a caller mumbling, and the agent
+            # answered both with "sorry, I didn't catch that" -- telling
+            # somebody to speak more clearly while the fault was entirely
+            # ours. For an applicant who already expects machines not to
+            # understand them, that is the exact humiliation this product
+            # exists to remove, and it is unanswerable: no amount of speaking
+            # clearly fixes a 503.
             log.warning("classification call failed: %s", exc)
-            return None
+            raise ModelUnavailableError(str(exc)) from exc
 
         parsed = response.parsed
         if parsed is None:

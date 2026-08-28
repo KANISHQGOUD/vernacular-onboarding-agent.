@@ -40,6 +40,10 @@ class AuditKind(StrEnum):
     # it means the notice may not have been heard in full, and DPDP requires
     # notice as well as consent. Recorded so the question is answerable later.
     CALLER_INTERRUPTED = "CALLER_INTERRUPTED"
+    # A turn lost to us, not to them. Counted separately from a refusal
+    # because "how often did our vendor fail a caller" is an operational
+    # question, and folding it into "not understood" answers it as zero.
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 
 
 @dataclass(frozen=True, slots=True)

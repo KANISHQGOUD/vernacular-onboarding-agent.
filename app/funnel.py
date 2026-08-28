@@ -87,6 +87,9 @@ class Funnel:
     lapses: Counter = field(default_factory=Counter)
     interruptions: Counter = field(default_factory=Counter)
     refusals: Counter = field(default_factory=Counter)
+    # Turns lost to us rather than to the caller. Kept apart from
+    # refusals so a vendor outage cannot be read as people failing.
+    outages: Counter = field(default_factory=Counter)
 
     @property
     def completed(self) -> int:
@@ -177,6 +180,8 @@ def build(trails: Iterable[Sequence[AuditEvent]]) -> Funnel:
                 funnel.interruptions[record.from_state] += 1
             elif record.kind is AuditKind.TRANSITION_REFUSED and record.from_state:
                 funnel.refusals[record.from_state] += 1
+            elif record.kind is AuditKind.PROVIDER_UNAVAILABLE and record.from_state:
+                funnel.outages[record.from_state] += 1
 
     previous = None
     for index, state in enumerate(JOURNEY):

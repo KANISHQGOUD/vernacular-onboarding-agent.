@@ -112,6 +112,19 @@ had been heard, so the same cough left the detector listening forever. Both
 found by pulling the decision out of the animation loop into a pure function
 and feeding it made-up numbers — no microphone involved.
 
+**"Say that again" was the wrong answer to a vendor outage.** When Gemini
+returned `503 UNAVAILABLE` mid-conversation, the classifier returned `None` —
+the same value it returns when it read the caller and understood nothing — so
+the agent replied *"Sorry, I didn't catch that."* A comment in the code said
+those cases were "all the same to the caller". They are not. Telling somebody
+to speak more clearly when the fault is entirely ours is unanswerable: no
+amount of speaking clearly fixes a 503, and for an applicant who already
+expects machines not to understand them it is the exact humiliation this
+product exists to remove. Unreachability now raises rather than returning
+`None`, gets its own speech act — *"That's not you"* — and is counted in the
+funnel apart from refusals, so a vendor's bad afternoon cannot be read as
+people failing.
+
 ## Try it
 
 Requires Python 3.13 and, optionally, Docker.

@@ -56,6 +56,7 @@ class SpeechActKind(StrEnum):
     CONFIRM_COMPLETED = "CONFIRM_COMPLETED"
     ACKNOWLEDGE_NO_CONSENT = "ACKNOWLEDGE_NO_CONSENT"
     ACKNOWLEDGE_STOPPED = "ACKNOWLEDGE_STOPPED"
+    ADMIT_OUR_FAULT = "ADMIT_OUR_FAULT"
     HANDING_TO_HUMAN = "HANDING_TO_HUMAN"
     DID_NOT_UNDERSTAND = "DID_NOT_UNDERSTAND"
 
@@ -129,6 +130,23 @@ SPEECH_ACTS: Mapping[SpeechActKind, SpeechActSpec] = MappingProxyType(
                 fallback=(
                     "Alright, we'll stop here. Whatever you've finished so far "
                     "is saved."
+                ),
+            ),
+            SpeechActSpec(
+                kind=SpeechActKind.ADMIT_OUR_FAULT,
+                intent=(
+                    "Something on your side is not working. Say so plainly, say "
+                    "it is not their fault, and ask them to try again in a "
+                    "moment. Do NOT ask them to speak more clearly or more "
+                    "slowly -- nothing they do differently will help, and "
+                    "implying otherwise blames them for a fault that is ours."
+                ),
+                # This one has to survive the outage that causes it. The model
+                # is by definition unreachable when this act is selected, so
+                # what a caller actually hears is almost always this string.
+                fallback=(
+                    "Sorry — something isn't working on our side just now. "
+                    "That's not you. Please try again in a moment."
                 ),
             ),
             SpeechActSpec(

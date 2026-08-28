@@ -127,6 +127,17 @@ def report(funnel) -> None:
         for name, count in funnel.interruptions.most_common():
             print(f"  {name:<22}{count:>4}")
 
+    if funnel.outages:
+        print()
+        print("TURNS LOST TO US, NOT TO THEM (provider unavailable)")
+        print("-" * 54)
+        for name, count in funnel.outages.most_common():
+            print(f"  {name:<22}{count:>4}")
+        print()
+        print("  A caller who is told 'say that again' when our vendor is down")
+        print("  cannot fix it by speaking more clearly. Counted apart from")
+        print("  refusals so the number cannot read as people failing.")
+
     if funnel.refusals:
         print()
         print("WHERE THE MACHINE SAID NO (a refused transition)")
@@ -178,6 +189,7 @@ def main() -> None:
                     "lapses": dict(funnel.lapses),
                     "interruptions": dict(funnel.interruptions),
                     "refusals": dict(funnel.refusals),
+                    "outages": dict(funnel.outages),
                 },
                 indent=2,
             ),

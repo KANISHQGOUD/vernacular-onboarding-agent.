@@ -295,3 +295,29 @@ def test_the_prompt_carries_the_menu_and_the_words():
     assert "haan ji theek hai" in prompt
     for event in offered:
         assert event.name in prompt
+
+
+def test_an_api_failure_raises_rather_than_looking_like_a_mumble():
+    """`None` used to mean both "understood nothing" and "could not reach the
+    thing that understands". Those need different answers, so only one of them
+    is still None."""
+    from google.genai import errors as genai_errors
+    from google.genai import types
+
+    from app.llm.client import LlmClient, ModelUnavailableError
+
+    class Down:
+        class models:
+            @staticmethod
+            def generate_content(**kwargs):
+                raise genai_errors.ServerError(503, {"error": {"message": "high demand"}})
+
+    client = LlmClient(api_key="x")
+    client._client = Down()
+
+    with pytest.raises(ModelUnavailableError):
+        client.extract(
+            system_instruction="system",
+            prompt="hindi",
+            schema=types.Schema(type=types.Type.OBJECT),
+        )

@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Callable, Mapping
 
+from app.audit import AuditKind
 from app.flow.actions import ActionRefused, Actions
 from app.flow.eligibility import DeclineReason, Residency
 from app.flow.intents import UntrustedEventError
@@ -46,6 +47,7 @@ from app.flow.machine import FlowError
 from app.flow.states import Event, State
 from app.languages import DEFAULT_LANGUAGE, normalise
 from app.llm.classifier import Classification, GeminiIntentClassifier
+from app.llm.client import ModelUnavailableError
 from app.llm.phrasing import Phraser
 from app.llm.speech_acts import SpeechAct, SpeechActKind
 from app.providers.payments import format_rupees
@@ -152,6 +154,29 @@ class Conversation:
 
         try:
             reading = self.classifier.read(utterance, session.state)
+        except ModelUnavailableError:
+            # Ours, not theirs. The session does not move, nothing is recorded
+            # against the caller, and what they hear says so.
+            log.warning("model unavailable in %s -- telling them it is us", before)
+            self.actions.machine.record(
+                session,
+                AuditKind.PROVIDER_UNAVAILABLE,
+                detail="classifier unreachable; turn lost",
+            )
+            return Reply(
+                text=self.phraser.say(
+                    SpeechAct(
+                        kind=SpeechActKind.ADMIT_OUR_FAULT,
+                        language=session.language or DEFAULT_LANGUAGE,
+                    )
+                ),
+                state=session.state,
+                moved=False,
+                # Not an understanding failure. Marking it understood=False
+                # would put it in the same bucket as a mumble, which is the
+                # conflation this exists to undo.
+                understood=True,
+            )
         except UntrustedEventError:
             # The classifier asserted a fact -- KYC passed, money moved. That
             # is a privilege violation, and it is logged at ERROR so monitoring
@@ -165,8 +190,11 @@ class Conversation:
             return self._reply(session, moved=False, understood=False)
 
         if reading is None:
-            # Not understood, rate-limited, or the model was unreachable. All
-            # three are the same to the caller, and none of them move anything.
+            # Genuinely not understood: the model answered, and nothing it
+            # returned maps to an intent that is legal here. Unreachability no
+            # longer arrives this way -- it raises -- because telling somebody
+            # to say it again is only useful advice when saying it again could
+            # possibly work.
             return self._reply(session, moved=False, understood=False)
 
         self._record_before_moving(session, reading)
