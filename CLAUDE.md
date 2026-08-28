@@ -253,6 +253,33 @@ provider**. Two ways out, neither built: read the answer back at the regulated
 gates, or keep browser STT (which does report confidence) and use Sarvam only
 for synthesis — also the cheaper arrangement, since TTS is most of the bill.
 
+### Synthesis is cached, because it is 92% of the bill
+
+Measured: a 20-turn conversation is about **Rs 9.83**, of which **Rs 9.00 is
+TTS**. On a one-time Rs 100 credit that is ten conversations, and this needs
+demonstrating more than ten times.
+
+Most of what the agent says is not new. Every `fallback` in `speech_acts.py`
+is a fixed literal, and the consent explanation and KYC handoff are spoken in
+every single call. `app/speech/cache.py` wraps any provider and keeps
+synthesis on disk, keyed on provider + model + speaker + language + text.
+
+Measured against the live vendor, the same sentence twice:
+
+    1st call (paid)     1570.3 ms
+    2nd call (cached)      9.2 ms     170x, and free
+
+The latency matters as much as the money for a voice agent. `CachedSpeech.warm()`
+pays for the fixed fallbacks once, deliberately, rather than discovering the
+bill one live demo at a time.
+
+**Transcription is never cached.** Two recordings of the same words are never
+byte-identical, so it would never hit -- and a key loose enough to hit would
+hand one caller's words back for another caller's audio. Silent, wrong, and in
+the one direction this project cannot afford.
+
+`.speech-cache/` is gitignored: regenerable, but only by paying again.
+
 Live tests are **opt in**, not opt out:
 
 ```bash

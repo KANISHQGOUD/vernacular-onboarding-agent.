@@ -18,7 +18,14 @@ from app.flow.hearing import (
     is_confident_enough,
 )
 from app.flow.states import State
-from app.speech import Audio, MockSpeech, SarvamSpeech, SpeechProvider, Transcript
+from app.speech import (
+    Audio,
+    CachedSpeech,
+    MockSpeech,
+    SarvamSpeech,
+    SpeechProvider,
+    Transcript,
+)
 from app.speech.sarvam import from_vendor, to_vendor
 
 # ---------------------------------------------------------------------------
@@ -352,3 +359,115 @@ def test_a_hindi_sentence_survives_a_round_trip():
     assert "आशा" in stripped, f"lost the name entirely: {heard.text!r}"
     assert heard.language == "hi-IN"
     assert heard.confidence is None, "the vendor started reporting confidence"
+
+
+# ---------------------------------------------------------------------------
+# Caching. Synthesis is 92% of the bill, and most of it is the same sentences.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cached(tmp_path):
+    return CachedSpeech(inner=MockSpeech(), directory=tmp_path / "speech")
+
+
+def test_the_same_sentence_is_only_paid_for_once(cached):
+    """Measured against Sarvam: a 20-turn conversation is ~Rs 9.83, of which
+    ~Rs 9.00 is TTS. Most of that is fixed fallbacks repeated every call."""
+    first = cached.synthesize("aapka khaata khul gaya", "hi-IN")
+    second = cached.synthesize("aapka khaata khul gaya", "hi-IN")
+
+    assert first.data == second.data
+    assert cached.spend.misses == 1
+    assert cached.spend.hits == 1
+    # The vendor was asked exactly once.
+    assert len(cached.inner.spoken) == 1
+
+
+def test_a_different_language_is_a_different_recording(cached):
+    """The bug this prevents is audible, not visible: the right words in the
+    wrong voice, served from a key that ignored the language."""
+    cached.synthesize("namaste", "hi-IN")
+    cached.synthesize("namaste", "ta-IN")
+
+    assert cached.spend.misses == 2
+    assert len(cached.inner.spoken) == 2
+
+
+def test_changing_the_voice_invalidates_the_cache(tmp_path):
+    """Model and speaker are in the key. Otherwise switching speaker would
+    keep serving the old one -- a bug you hear rather than see."""
+    one = CachedSpeech(inner=SarvamSpeech(api_key="x", speaker="ritu"), directory=tmp_path)
+    two = CachedSpeech(inner=SarvamSpeech(api_key="x", speaker="priya"), directory=tmp_path)
+
+    assert one._key("hello", "hi-IN") != two._key("hello", "hi-IN")
+
+
+def test_transcription_is_never_cached(cached):
+    """Two recordings of the same words are never byte-identical, so a cache
+    would never hit -- and a key loose enough to hit would hand one caller's
+    words back for another caller's audio. Silent, wrong, unaffordable."""
+    clip = Audio(data=b"\x00\x01", media_type="audio/wav")
+
+    cached.transcribe(clip, "hi-IN")
+    cached.transcribe(clip, "hi-IN")
+
+    assert cached.spend.hits == 0
+    assert not list(cached.directory.glob("*")) if cached.directory.exists() else True
+
+
+def test_a_failed_synthesis_is_not_cached(tmp_path):
+    """Caching a failure would make one bad response permanent."""
+
+    class Broken:
+        name = "broken"
+
+        def synthesize(self, text, language):
+            raise RuntimeError("vendor is down")
+
+        def transcribe(self, audio, language):  # pragma: no cover
+            raise NotImplementedError
+
+    cache = CachedSpeech(inner=Broken(), directory=tmp_path / "speech")
+
+    with pytest.raises(RuntimeError):
+        cache.synthesize("hello", "hi-IN")
+
+    assert not (tmp_path / "speech").exists() or not list((tmp_path / "speech").iterdir())
+
+
+def test_the_cache_survives_a_restart(tmp_path):
+    """It is on disk, not in memory. A redeploy must not re-buy every prompt."""
+    first = CachedSpeech(inner=MockSpeech(), directory=tmp_path / "speech")
+    first.synthesize("aapka khaata khul gaya", "hi-IN")
+
+    second = CachedSpeech(inner=MockSpeech(), directory=tmp_path / "speech")
+    second.synthesize("aapka khaata khul gaya", "hi-IN")
+
+    assert second.spend.hits == 1
+    assert second.inner.spoken == [], "a new process paid for it again"
+
+
+def test_warming_pays_once_deliberately(cached):
+    """The fallbacks are known before anyone calls. Paying for them on purpose
+    beats discovering the bill one live demo at a time."""
+    from app.llm.speech_acts import SPEECH_ACTS
+
+    phrases = [(spec.fallback, "hi-IN") for spec in SPEECH_ACTS.values()]
+    spend = cached.warm(phrases)
+
+    assert spend.misses == len(SPEECH_ACTS)
+    assert spend.hits == 0
+
+    # Every one of them is free from here on.
+    cached.warm(phrases)
+    assert cached.spend.hits == len(SPEECH_ACTS)
+
+
+def test_the_spend_report_is_arithmetic_not_a_guess(cached):
+    cached.synthesize("x" * 10_000, "hi-IN")
+    assert cached.spend.chars_synthesised == 10_000
+    assert cached.spend.rupees_spent == pytest.approx(30.0)
+
+    cached.synthesize("x" * 10_000, "hi-IN")
+    assert cached.spend.rupees_saved == pytest.approx(30.0)

@@ -7,13 +7,16 @@ from app.speech.provider import (
     SpeechProvider,
     Transcript,
 )
+from app.speech.cache import CachedSpeech, SpeechSpend
 from app.speech.sarvam import SarvamSpeech
 
 __all__ = [
     "Audio",
+    "CachedSpeech",
     "MockSpeech",
     "SpeechError",
     "SarvamSpeech",
     "SpeechProvider",
+    "SpeechSpend",
     "Transcript",
 ]
