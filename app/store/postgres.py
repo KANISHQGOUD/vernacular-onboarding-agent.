@@ -97,6 +97,13 @@ SEQUENCE_ATTEMPTS = 5
 # conversation, so concurrency here is the number of callers talking at once,
 # not a query-per-row workload. Borrowers above `max_size` wait rather than
 # fail, which is the correct answer for a load this shape.
+# A database that is not there should say so in seconds. libpq's default is to
+# wait indefinitely, and psycopg_pool then waits 30 more for a connection that
+# is never coming -- which turned "Docker is not running" into a four and a
+# half minute test run ending in twenty-two identical timeouts. The failure was
+# always going to happen; the only question was how long it took to admit it.
+CONNECT_TIMEOUT_SECONDS = 5
+
 POOL_MIN_SIZE = 2
 POOL_MAX_SIZE = 10
 
@@ -127,7 +134,8 @@ def open_pool(
         conninfo,
         min_size=min_size,
         max_size=max_size,
-        kwargs={"autocommit": False},
+        kwargs={"autocommit": False, "connect_timeout": CONNECT_TIMEOUT_SECONDS},
+        timeout=CONNECT_TIMEOUT_SECONDS * 2,
         name=name,
         open=True,
     )
@@ -136,7 +144,9 @@ def open_pool(
 def apply_schema(conninfo: str) -> None:
     """Create the tables, indexes and triggers. Safe to run repeatedly."""
     sql = SCHEMA_PATH.read_text(encoding="utf-8")
-    with psycopg.connect(conninfo, autocommit=True) as connection:
+    with psycopg.connect(
+        conninfo, autocommit=True, connect_timeout=CONNECT_TIMEOUT_SECONDS
+    ) as connection:
         connection.execute(sql)
     log.info("schema applied")
 
@@ -360,7 +370,7 @@ class PostgresAuditSink:
 
 def describe(conninfo: str) -> dict[str, Any]:
     """A cheap health check: is the schema there, and how much is in it."""
-    with psycopg.connect(conninfo) as connection:
+    with psycopg.connect(conninfo, connect_timeout=CONNECT_TIMEOUT_SECONDS) as connection:
         counts = {}
         for table in ("sessions", "session_tokens", "audit_events"):
             counts[table] = connection.execute(
