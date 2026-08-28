@@ -4,3 +4,4 @@ google-genai
 fastapi
 uvicorn[standard]
 psycopg[binary,pool]
+sarvamai

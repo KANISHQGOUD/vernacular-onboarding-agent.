@@ -6,6 +6,9 @@ existing before any vendor is chosen.
 
 from __future__ import annotations
 
+import os
+import unicodedata
+
 import pytest
 
 from app.flow.hearing import (
@@ -15,7 +18,8 @@ from app.flow.hearing import (
     is_confident_enough,
 )
 from app.flow.states import State
-from app.speech import Audio, MockSpeech, SpeechProvider, Transcript
+from app.speech import Audio, MockSpeech, SarvamSpeech, SpeechProvider, Transcript
+from app.speech.sarvam import from_vendor, to_vendor
 
 # ---------------------------------------------------------------------------
 # The vocabulary.
@@ -155,3 +159,196 @@ def test_an_unreported_confidence_passes_and_that_is_deliberate():
 def test_the_floors_are_all_plausible_probabilities():
     for state, floor in CONFIDENCE_FLOOR.items():
         assert 0.0 < floor <= 1.0, f"{state} has a nonsense floor"
+
+
+# ---------------------------------------------------------------------------
+# Sarvam. Offline by default -- the live tests cost real money.
+# ---------------------------------------------------------------------------
+
+
+class FakeSarvamClient:
+    """Enough of the vendor SDK to exercise the adapter without a network."""
+
+    def __init__(self, transcript="मेरा नाम आशा देवी है", language_code="hi-IN"):
+        self.speech_to_text = self._Stt(transcript, language_code)
+        self.text_to_speech = self._Tts()
+
+    class _Stt:
+        def __init__(self, transcript, language_code):
+            self.transcript_value = transcript
+            self.language_code = language_code
+            self.calls = []
+
+        def transcribe(self, **kwargs):
+            self.calls.append(kwargs)
+            import types
+
+            return types.SimpleNamespace(
+                transcript=self.transcript_value,
+                language_code=self.language_code,
+                # The vendor really does return this, and it is NOT a
+                # transcription confidence. Present here so a test can prove
+                # the adapter ignores it.
+                language_probability=0.98,
+            )
+
+    class _Tts:
+        def __init__(self):
+            self.calls = []
+
+        def convert(self, **kwargs):
+            import base64
+            import types
+
+            self.calls.append(kwargs)
+            return types.SimpleNamespace(audios=[base64.b64encode(b"RIFFfake").decode()])
+
+
+def fake_sarvam(**kwargs) -> SarvamSpeech:
+    provider = SarvamSpeech(api_key="not-a-real-key", **kwargs)
+    provider._client = FakeSarvamClient()
+    return provider
+
+
+def test_sarvam_satisfies_the_protocol():
+    assert isinstance(fake_sarvam(), SpeechProvider)
+
+
+def test_odia_is_spelled_the_vendor_way_only_at_the_boundary():
+    """Sarvam spells Odia `od-IN`; ISO 639-1, and this project, say `or-IN`.
+
+    The translation belongs in the adapter. One vendor's spelling is not a
+    reason to make the shared vocabulary wrong, and the next provider will
+    have a different quirk in a different place.
+    """
+    assert to_vendor("or-IN") == "od-IN"
+    assert from_vendor("od-IN") == "or-IN"
+
+    # Everything else passes straight through, both ways.
+    for code in ("hi-IN", "ta-IN", "en-IN"):
+        assert to_vendor(code) == code
+        assert from_vendor(code) == code
+
+    provider = fake_sarvam()
+    provider.synthesize("ନମସ୍କାର", "or-IN")
+    assert provider.client.text_to_speech.calls[0]["target_language_code"] == "od-IN"
+
+
+def test_the_project_never_learns_the_vendor_spelling():
+    """`or-IN` is what the rest of the codebase speaks, and stays that way."""
+    from app.languages import LANGUAGE_CODES
+
+    assert "or-IN" in LANGUAGE_CODES
+    assert "od-IN" not in LANGUAGE_CODES
+
+
+def test_language_probability_is_not_used_as_a_confidence():
+    """The gap that matters, pinned so it cannot be closed by accident.
+
+    Sarvam returns `language_probability` -- how sure it is the audio was
+    Hindi -- and no transcription confidence at all. Passing that number
+    through would put a value into hearing.py's floors that does not mean what
+    they assume, and the consent gate would then be comparing 0.85 against an
+    answer to a different question.
+
+    So confidence is None, `is_confident_enough` lets the turn through, and
+    the protection genuinely does not exist on this provider. Better named
+    than quietly faked.
+    """
+    heard = fake_sarvam().transcribe(Audio(data=b"x", media_type="audio/wav"), "hi-IN")
+
+    assert heard.text
+    assert heard.confidence is None, "language_probability leaked in as confidence"
+    assert not SarvamSpeech(api_key="x").reports_confidence
+
+    from app.flow.hearing import is_confident_enough
+    from app.flow.states import State
+
+    assert is_confident_enough(heard.confidence, State.CONSENT), (
+        "documented consequence: this provider cannot guard the consent gate"
+    )
+
+
+def test_the_transcript_reports_the_language_that_came_back():
+    """Not the one we asked for. They can differ, and the caller should see it."""
+    provider = fake_sarvam()
+    provider._client = FakeSarvamClient(transcript="hello", language_code="en-IN")
+
+    heard = provider.transcribe(Audio(data=b"x", media_type="audio/wav"), "hi-IN")
+    assert heard.language == "en-IN"
+    assert heard.provider == "sarvam"
+
+
+def test_the_verified_defaults_are_the_ones_that_answered():
+    """The SDK's Literal[...] lists disagree with the live API in both
+    directions -- bulbul:v2 is deprecated, anushka is invalid for v3, and
+    niharika exists only on the API side. These are the measured values."""
+    provider = SarvamSpeech(api_key="x")
+    assert provider.tts_model == "bulbul:v3"
+    assert provider.speaker != "anushka"
+
+    fake = fake_sarvam()
+    fake.synthesize("hi", "hi-IN")
+    sent = fake.client.text_to_speech.calls[0]
+    assert sent["model"] == "bulbul:v3"
+    assert sent["speaker"] == provider.speaker
+
+
+def test_constructing_it_opens_no_connection():
+    """The client is built on first use, so the suite can construct providers
+    freely and `sarvamai` need not be installed for the rest to run."""
+    provider = SarvamSpeech(api_key="x")
+    assert provider._client is None
+
+
+# ---------------------------------------------------------------------------
+# The live ones. Opt IN, not opt out -- these spend a finite prepaid balance.
+# ---------------------------------------------------------------------------
+
+LIVE = os.getenv("SARVAM_LIVE", "").strip() == "1"
+
+live_only = pytest.mark.skipif(
+    not LIVE,
+    reason="set SARVAM_LIVE=1 to spend real credit on these",
+)
+
+
+@live_only
+def test_a_hindi_sentence_survives_a_round_trip():
+    """Synthesise, then transcribe what came back.
+
+    Note what this does NOT prove: Sarvam transcribing its own clean synthesis
+    is far easier than a person in a room with a fan on. This is a check that
+    the plumbing works, not evidence about accuracy -- that needs the WER
+    comparison against real recordings.
+    """
+    provider = SarvamSpeech(api_key=os.environ["SARVAM_API_KEY"])
+    said = "मेरा नाम आशा देवी है"
+
+    audio = provider.synthesize(said, "hi-IN")
+    assert len(audio) > 1000
+    assert audio.data[:4] == b"RIFF"
+
+    heard = provider.transcribe(audio, "hi-IN")
+
+    # NOT an exact match, and not a substring check either. The first version
+    # of this asserted `said in heard.text` and passed, then failed on the very
+    # next run: recognition is not deterministic, and it had added a danda one
+    # time and not the next. A flaky test on the speech path is worse than no
+    # test, because people learn to re-run it until it goes green.
+    #
+    # So this asserts what it claims to: the plumbing carried real Devanagari
+    # there and back. Accuracy is the WER comparison's job, against recordings
+    # of actual people rather than the vendor's own clean synthesis.
+    # Strip PUNCTUATION, not "anything not alnum". The first attempt used
+    # `ch.isalnum()` and turned आशा into आश, because Devanagari vowel signs
+    # are combining marks (category Mn) and isalnum() is False for them.
+    # A filter written that way quietly mutilates every script this project
+    # exists to serve, and would have looked like a vendor accuracy problem.
+    stripped = "".join(
+        ch for ch in heard.text if not unicodedata.category(ch).startswith("P")
+    )
+    assert stripped.split(), f"nothing came back: {heard.text!r}"
+    assert "आशा" in stripped, f"lost the name entirely: {heard.text!r}"
+    assert heard.language == "hi-IN"
+    assert heard.confidence is None, "the vendor started reporting confidence"

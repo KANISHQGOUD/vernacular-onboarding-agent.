@@ -171,6 +171,12 @@ purpose.
   tool or a Python script.
 - **`git checkout -- <file>` discards uncommitted work.** Copy the file aside
   before mutation-testing; this bit once in this repo.
+- A dead database reports in ~11s, not 4.5 minutes: `CONNECT_TIMEOUT_SECONDS`
+  in `app/store/postgres.py`. libpq waits forever by default.
+- Naive `ch.isalnum()` filtering **destroys Indic text** — Devanagari vowel
+  signs are combining marks (category Mn) and isalnum() is False for them,
+  so `आशा` becomes `आश`. Strip by punctuation category instead. This looked
+  exactly like a vendor accuracy problem for one debugging round.
 - Port 5432 is this project. 54321–54327 is the `barkeep` Supabase stack from
   another project — do not disturb it.
 
@@ -215,10 +221,46 @@ Awkward, because TTS is roughly 85% of Sarvam's per-conversation cost: the
 free option covers the cheap half and fails on the expensive one. That is the
 argument for self-hosting IndicF5.
 
-**Sarvam is blocked**: `SARVAM_API_KEY` is present but empty and `sarvamai` is
-not installed. ₹100 free credit on signup, credits never expire, 60 req/min;
-STT ₹30/hour, TTS ₹15/10K chars (Bulbul v2). Roughly 12–20 conversations —
-spend it on a measured comparison, not on development.
+### Sarvam
+
+`app/speech/sarvam.py`, SDK `sarvamai` **0.1.31**. Working — a Hindi sentence
+round-trips (synthesise, then transcribe) with only an added danda.
+
+**The SDK's `Literal[...]` lists disagree with the live API in both
+directions.** All three found by calling it, none by reading:
+
+| | |
+|---|---|
+| `bulbul:v2` | SDK offers it; API returns 400 "has been deprecated" |
+| `anushka` | SDK lists it first; API rejects it for `bulbul:v3` |
+| `niharika` | API offers it for v3; SDK has never heard of it |
+
+Verified defaults: **`bulbul:v3`**, **`saaras:v4`**, speaker **`ritu`**. Since
+v2 is gone, TTS really costs ₹30/10K chars, not the ₹15 the pricing page lists
+for v2 — so ₹100 is roughly 33K characters, call it 6–10 conversations rather
+than 12–20.
+
+**Sarvam spells Odia `od-IN`.** ISO 639-1, and this project, say `or-IN`. The
+mapping lives in the adapter, not in `languages.py`: one vendor's spelling is
+not a reason to make the shared vocabulary wrong.
+
+**Sarvam STT returns no transcription confidence.** It returns
+`language_probability`, which answers "was this Hindi" — a different question,
+and feeding it to `hearing.py` would compare 0.85 against an answer to
+something else. So `Transcript.confidence` is None and `reports_confidence` is
+False, which means **the consent gate's protection does not exist on this
+provider**. Two ways out, neither built: read the answer back at the regulated
+gates, or keep browser STT (which does report confidence) and use Sarvam only
+for synthesis — also the cheaper arrangement, since TTS is most of the bill.
+
+Live tests are **opt in**, not opt out:
+
+```bash
+SARVAM_LIVE=1 .venv\Scripts\python.exe -m pytest tests/test_speech.py
+```
+
+Gating on the key being present, the way the Postgres tests gate on
+`DATABASE_URL`, would mean having a key makes every suite run cost money.
 
 ---
 
