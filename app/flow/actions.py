@@ -133,6 +133,23 @@ class Actions:
         )
         return session
 
+    def record_interruption(self, session: Session) -> Session:
+        """They talked over the agent, somewhere it matters.
+
+        Not a refusal and not a transition -- barge-in is allowed everywhere,
+        and the session does not move. It goes in the trail because at the
+        consent gate "did this person actually receive the notice" is a
+        question somebody may have to answer, and four seconds into a
+        twenty-second explanation is a weak yes.
+        """
+        session.notes["interrupted_in"] = str(session.state)
+        self.machine.record(
+            session,
+            AuditKind.CALLER_INTERRUPTED,
+            detail=f"caller spoke over the agent in {session.state}",
+        )
+        return session
+
     def escalate_to_human(self, session: Session, reason: str) -> Session:
         self.machine.assert_tool_allowed(session, ToolName.ESCALATE_TO_HUMAN)
         session.notes["escalation_reason"] = reason

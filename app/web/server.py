@@ -56,6 +56,7 @@ from app.conversation import Conversation
 from app.flow.actions import Actions
 from app.flow.machine import Machine
 from app.flow.hearing import is_confident_enough
+from app.flow.turn_taking import interruption_matters, policy_for
 from app.flow.states import TERMINAL_STATES, State
 from app.llm.classifier import GeminiIntentClassifier, OfflineClassifier
 from app.llm.client import LlmClient, api_key_available
@@ -298,6 +299,12 @@ def create_app(
                 # signal from our own front end, not a check on an adversary.
                 # Under a server-side topology the number would come from our
                 # provider instead and could be trusted properly.
+                # Barge-in, where it is material. Recorded before the turn
+                # is processed, so the note lands against the state they
+                # interrupted rather than the one they end up in.
+                if message.get("interrupted") and interruption_matters(loaded.state):
+                    conversation.actions.record_interruption(loaded)
+
                 if not is_confident_enough(_confidence(message), loaded.state):
                     reply = conversation.misheard(loaded)
                     registry.save(loaded)
@@ -385,6 +392,10 @@ def _payload(reply, session, speech: SpeechProvider | None = None) -> dict:
         # Present only when server-side synthesis is on. The page prefers it
         # and falls back to speechSynthesis when it is absent.
         "audio": _spoken(reply, session, speech),
+        # How patient to be before deciding they have stopped talking. Sent
+        # per turn because it changes with the state, and the page should not
+        # have to know why -- see app/flow/turn_taking.py.
+        "turn": policy_for(session.state),
     }
 
 

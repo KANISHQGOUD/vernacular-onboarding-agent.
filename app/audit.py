@@ -35,6 +35,11 @@ class AuditKind(StrEnum):
     # exists to be able to answer afterwards.
     SESSION_LAPSED = "SESSION_LAPSED"
     SESSION_RETURNED = "SESSION_RETURNED"
+    # They started talking before the agent had finished. Always permitted --
+    # a person must be able to interrupt a machine -- but at the consent gate
+    # it means the notice may not have been heard in full, and DPDP requires
+    # notice as well as consent. Recorded so the question is answerable later.
+    CALLER_INTERRUPTED = "CALLER_INTERRUPTED"
 
 
 @dataclass(frozen=True, slots=True)

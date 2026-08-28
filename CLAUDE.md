@@ -297,7 +297,14 @@ Gating on the key being present, the way the Postgres tests gate on
 - **Nothing fires a lapse.** `record_lapse()` exists and is tested, but no
   timer calls it. Needs a clock-injection decision consistent with how
   `eligibility.py` takes an explicit `as_of` rather than reading a clock.
-- **Sarvam STT/TTS**, then Silero VAD for turn-taking. Both need the key.
+- **Turn-taking thresholds are untuned.** `app/flow/turn_taking.py` reasons
+  the windows from the product; the energy constants in `web/index.html`
+  (VOICE_MARGIN, MIN_THRESHOLD, MIN_SPEECH_MS) have never met a real room.
+  Watch the level meter while speaking: red only while you talk.
+
+  Silero VAD does not fit this topology and was not used -- it runs
+  server-side on audio frames, and the server never receives audio because
+  recognition happens in the browser.
 - **The WER comparison needs recordings.** `scripts/wer.py` is built and
   tested; it has only ever run against synthesised audio, which proves the
   harness and nothing about accuracy. It needs real speakers.

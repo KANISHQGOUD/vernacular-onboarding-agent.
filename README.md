@@ -103,6 +103,15 @@ extraction step downstream wants `1990`. The report now prints every
 disagreeing transcript rather than a percentage, so nobody can quote the
 aggregate without having read them.
 
+**The turn detector answered a cough.** Endpointing measured "how long have
+they been speaking" from the first voiced frame to *now* rather than to the
+last voiced frame — so a 100ms cough followed by eight seconds of silence
+looked like eight seconds of speech, and the agent replied to a chair scrape.
+Behind it sat a second bug: the give-up timer was unreachable once any noise
+had been heard, so the same cough left the detector listening forever. Both
+found by pulling the decision out of the animation loop into a pure function
+and feeding it made-up numbers — no microphone involved.
+
 ## Try it
 
 Requires Python 3.13 and, optionally, Docker.
@@ -190,6 +199,51 @@ The manifest is committed; the audio is not. A recording of somebody's voice
 is personal data, and a project that argues about DPDP compliance should not
 ship a folder of real people saying their names into a public repository.
 
+## Turn-taking
+
+Tick **hands-free** and the button stops mattering: the agent listens, decides
+you have finished, answers, and listens again.
+
+The detector runs in the browser, because that is where the microphone is.
+Silero VAD was the original plan and does not fit — it runs server-side on
+audio frames, and in this topology the server never receives audio, because
+recognition happens in the page.
+
+What stays server-side is the **policy**: how long a pause means "finished".
+That is a judgement about the conversation rather than about audio, so
+`app/flow/turn_taking.py` owns it and sends it with every reply. Same split as
+confidence — the client measures, the machine decides.
+
+The windows are deliberately slower than the 500–800ms most agents use. Those
+numbers are tuned on people who are fluent, unhurried and used to talking to
+machines, and this is explicitly for people who are none of those. Someone
+recalling their own address pauses; cutting them off and answering the
+fragment is the experience of being rushed through a form by a stranger, which
+is the thing being replaced.
+
+**The consent gate waits longest — 1.8 seconds — which looks wrong.** "हाँ" is
+one short word. But the second half of a sentence can reverse the first:
+
+    "हाँ..."            endpoint here and consent is recorded
+    "...नहीं, रुकिए"     which is what they were actually saying
+
+Endpointing early there does not clip a transcript. It records a consent that
+was being withdrawn while the agent stopped listening.
+
+**Barge-in is always allowed** — a person must be able to interrupt a machine.
+But interrupting the consent *notice* is written to the audit trail, because
+DPDP requires notice as well as consent, and "हाँ" four seconds into a
+twenty-second explanation is a weak claim to have received it. It is recorded,
+not refused; the point is that the question stays answerable.
+
+The level meter beside the controls shows the microphone and turns red when
+speech is detected — the energy thresholds are reasonable rather than measured,
+and tuning them needs a real room. The decision logic has its own cases:
+
+```bash
+open http://localhost:8000/?selftest=1
+```
+
 ## What is real and what is not
 
 **Real:** the state machine, the versioned eligibility rules, the append-only
@@ -211,8 +265,10 @@ tested, but it has only been run against synthesised audio, which proves the
 harness and nothing about accuracy. Both gaps need recordings of real people,
 which is the honest boundary of what one developer can do alone at a desk.
 
-Turn-taking (voice activity detection) is unbuilt, so the demo is
-push-to-talk.
+Turn-taking is built but its thresholds are untuned: the endpoint windows are
+reasoned from the product rather than measured against recordings, and the
+energy floor has never met a real room. It needs the same thing everything
+else here needs.
 
 ## Where to read next
 

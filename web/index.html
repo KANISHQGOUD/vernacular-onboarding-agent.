@@ -61,6 +61,9 @@
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
   button.listening { animation: pulse 1.1s ease-in-out infinite; }
   label.toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; opacity: .8; }
+  #meter { width: 90px; height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+  #level { height: 100%; width: 0%; background: #9aa0a6; transition: width .05s linear; }
+  #meter.voice #level { background: #b3261e; }
 </style>
 </head>
 <body>
@@ -86,6 +89,8 @@
   <button id="send" disabled>Send</button>
   <button id="mic" disabled title="Hold a conversation out loud">&#127908; Speak</button>
   <label class="toggle"><input type="checkbox" id="tts" checked> speak replies</label>
+  <label class="toggle"><input type="checkbox" id="handsfree"> hands-free</label>
+  <div id="meter" title="microphone level; red means speech detected"><div id="level"></div></div>
   <button id="retry" hidden>Reconnect</button>
 </footer>
 
@@ -99,6 +104,9 @@ const send = document.getElementById("send");
 const retry = document.getElementById("retry");
 const mic = document.getElementById("mic");
 const tts = document.getElementById("tts");
+const handsfree = document.getElementById("handsfree");
+const meter = document.getElementById("meter");
+const level = document.getElementById("level");
 
 let socket = null;
 let credentials = null;
@@ -133,6 +141,8 @@ const canSpeak = "speechSynthesis" in window;
 let recognition = null;
 let listening = false;
 let player = null;   // the <audio> playing a server-synthesised reply
+let heardSoFar = "";
+let bestConfidence = null;
 // The machine chooses the language and tells us. The browser never guesses it:
 // re-detecting per utterance would let one mumbled sentence switch somebody
 // into a language they cannot read.
@@ -198,6 +208,198 @@ function note(text) {
   bubble("note", text);
 }
 
+// ---------------------------------------------------------------------------
+// Turn-taking.
+//
+// The detector lives here because this is where the microphone is. The
+// POLICY -- how long a pause ends a turn -- arrives from the server with each
+// reply, because it depends on the conversation's state and the page has no
+// business deciding that. See app/flow/turn_taking.py.
+//
+// Two jobs:
+//
+//   endpointing  decide they have finished, and stop the recogniser. Chrome
+//                will endpoint on its own, but on a fixed heuristic we cannot
+//                tune. Running the recogniser in continuous mode and stopping
+//                it ourselves is what makes a per-state window possible.
+//   barge-in     if they start talking while the agent is talking, stop the
+//                agent. A machine that finishes its sentence over somebody is
+//                the support line everyone has met.
+//
+// Energy-based, with an ambient floor measured at the start of each turn
+// rather than a constant. A constant threshold is wrong in both directions:
+// deaf in a noisy room, hair-trigger in a quiet one, and this is meant for
+// people who are not in offices.
+//
+// UNTUNED. These constants are reasonable, not measured -- verifying them
+// needs a real microphone in a real room, which is what the level meter is
+// for. Watch it while speaking: the bar should turn red only while you talk.
+// ---------------------------------------------------------------------------
+const CALIBRATION_MS = 400;    // how long to listen to the room first
+const VOICE_MARGIN = 3.0;      // times the ambient floor to count as speech
+const MIN_THRESHOLD = 0.006;   // a floor for the floor, for silent rooms
+const MIN_SPEECH_MS = 200;     // shorter than this is a cough, not a turn
+
+// Pulled out of the animation loop so it can be exercised with made-up
+// numbers instead of a microphone. The loop measures; this decides, and the
+// deciding is the part with the bugs in it.
+//
+//   sawSpeech        have they said anything at all this turn
+//   speechStartedAt  when they began, for the too-short-to-count check
+//   lastVoiceAt      the last frame above the threshold
+//   silenceMs        the per-state window, from turn_taking.py
+//
+// Returns "listening", "endpoint" (they have finished) or "gave-up" (nobody
+// ever started). Separate answers because they need separate replies: one
+// sends a turn, the other says "I didn't catch anything".
+function turnVerdict({ sawSpeech, speechStartedAt, lastVoiceAt, startedAt, now, silenceMs, patienceMs, minSpeechMs }) {
+  // How long they actually spoke -- first voiced frame to LAST voiced frame.
+  // Measuring to `now` instead was a real bug: a 100ms cough followed by eight
+  // seconds of silence looked like eight seconds of speech, so the agent
+  // answered a chair scrape. In the rooms this product is for, that is not an
+  // edge case.
+  const speechDuration = sawSpeech ? lastVoiceAt - speechStartedAt : 0;
+  const enoughSpeech = speechDuration > minSpeechMs;
+  const quietFor = sawSpeech ? now - lastVoiceAt : now - startedAt;
+
+  if (enoughSpeech && quietFor > silenceMs) return "endpoint";
+
+  // Checked whether or not a noise was heard. Nesting this under `else` was
+  // the second half of the same bug: a cough set sawSpeech, and the detector
+  // then had no way to ever give up.
+  if (now - startedAt > patienceMs) return "gave-up";
+
+  return "listening";
+}
+
+// Re-runnable, because there is no JS test runner in this project and the
+// bug these caught was a real one: open the page with ?selftest=1 and read
+// the console. Cheaper than adding a toolchain for one pure function, and
+// honest about being a smaller promise than the Python suite.
+const TURN_CASES = [
+  ["nobody spoke, still patient",        { sawSpeech:false, now:5000 }, "listening"],
+  ["nobody spoke, patience spent",       { sawSpeech:false, now:12500 }, "gave-up"],
+  ["mid-sentence pause",                 { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:5200 }, "listening"],
+  ["just under the CONSENT window",      { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:5790 }, "listening"],
+  ["past the CONSENT window",            { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:5900 }, "endpoint"],
+  ["that pause ends LANGUAGE_SELECT",    { silenceMs:800, sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:4900 }, "endpoint"],
+  ["...but not CONSENT",                 { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:4900 }, "listening"],
+  ["a cough is not a turn",              { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:1100, now:9000 }, "listening"],
+  ["a cough eventually gives up",        { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:1100, now:12500 }, "gave-up"],
+  ["a short yes still counts",           { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:1350, now:3200 }, "endpoint"],
+];
+
+function runTurnSelfTest() {
+  const base = { startedAt: 0, minSpeechMs: 200, patienceMs: 12000, silenceMs: 1800 };
+  let failed = 0;
+  for (const [name, input, want] of TURN_CASES) {
+    const got = turnVerdict({ ...base, ...input });
+    if (got !== want) { failed++; console.error(`FAIL ${name}: wanted ${want}, got ${got}`); }
+    else console.log(`ok   ${name}`);
+  }
+  console.log(failed ? `${failed} FAILED` : `all ${TURN_CASES.length} passed`);
+  return failed === 0;
+}
+
+if (new URLSearchParams(location.search).get("selftest") === "1") {
+  setTimeout(runTurnSelfTest, 0);
+}
+
+let detector = null;
+let turnPolicy = { silence_ms: 1000, patience_ms: 12000, barge_in: true, report_interruption: false };
+let interruptedThisTurn = false;
+
+function agentIsTalking() {
+  return Boolean(player && !player.paused) ||
+         (canSpeak && window.speechSynthesis.speaking);
+}
+
+async function startDetector({ onSpeechEnd, onGaveUp }) {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  ctx.createMediaStreamSource(stream).connect(analyser);
+
+  const frame = new Float32Array(analyser.fftSize);
+  const startedAt = performance.now();
+  const ambient = [];
+
+  let threshold = MIN_THRESHOLD;
+  let speechStartedAt = 0;
+  let lastVoiceAt = 0;
+  let sawSpeech = false;
+  let raf = 0;
+
+  function tick() {
+    analyser.getFloatTimeDomainData(frame);
+    let sum = 0;
+    for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+    const rms = Math.sqrt(sum / frame.length);
+    const now = performance.now();
+
+    // Measure the room before judging anything in it.
+    if (now - startedAt < CALIBRATION_MS) {
+      ambient.push(rms);
+      raf = requestAnimationFrame(tick);
+      return;
+    }
+    if (ambient.length) {
+      const sorted = [...ambient].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)] || 0;
+      threshold = Math.max(median * VOICE_MARGIN, MIN_THRESHOLD);
+      ambient.length = 0;
+    }
+
+    const voice = rms > threshold;
+    level.style.width = Math.min(100, (rms / (threshold * 2)) * 100) + "%";
+    meter.classList.toggle("voice", voice);
+
+    if (voice) {
+      if (!sawSpeech) {
+        sawSpeech = true;
+        speechStartedAt = now;
+        // Barge-in. They started; the agent stops.
+        if (agentIsTalking()) {
+          interruptedThisTurn = true;
+          stopSpeaking();
+        }
+      }
+      lastVoiceAt = now;
+    }
+
+    const verdict = turnVerdict({
+      sawSpeech, speechStartedAt, lastVoiceAt, startedAt, now,
+      silenceMs: turnPolicy.silence_ms,
+      patienceMs: turnPolicy.patience_ms,
+      minSpeechMs: MIN_SPEECH_MS,
+    });
+
+    if (verdict === "endpoint") { stopDetector(); onSpeechEnd(); return; }
+    if (verdict === "gave-up") { stopDetector(); onGaveUp(); return; }
+
+    raf = requestAnimationFrame(tick);
+  }
+
+  detector = {
+    stop() {
+      cancelAnimationFrame(raf);
+      stream.getTracks().forEach(t => t.stop());
+      ctx.close().catch(() => {});
+      level.style.width = "0%";
+      meter.classList.remove("voice");
+    },
+  };
+  raf = requestAnimationFrame(tick);
+}
+
+function stopDetector() {
+  if (detector) { detector.stop(); detector = null; }
+}
+
 function startListening() {
   if (!canListen || listening) return;
 
@@ -207,9 +409,24 @@ function startListening() {
 
   recognition = new Recogniser();
   recognition.lang = language;
-  recognition.interimResults = false;   // no partials until VAD arrives
-  recognition.continuous = false;       // one utterance per press
+  // Continuous, and WE decide when it ends. Chrome endpoints on a heuristic
+  // we cannot tune; a per-state window is the whole point of turn_taking.py.
+  recognition.continuous = true;
+  recognition.interimResults = true;
   recognition.maxAlternatives = 1;
+
+  heardSoFar = "";
+  bestConfidence = null;
+  interruptedThisTurn = false;
+
+  startDetector({
+    onSpeechEnd: () => { try { recognition.stop(); } catch (e) {} },
+    onGaveUp: () => { try { recognition.stop(); } catch (e) {} },
+  }).catch(err => {
+    // No microphone, or permission refused. Fall back to Chrome's own
+    // endpointing rather than leaving the button dead.
+    note("Microphone unavailable for turn detection: " + err.name);
+  });
 
   recognition.onstart = () => {
     listening = true;
@@ -219,8 +436,12 @@ function startListening() {
 
   recognition.onend = () => {
     listening = false;
+    stopDetector();
     mic.classList.remove("listening");
     mic.innerHTML = "&#127908; Speak";
+
+    if (heardSoFar.trim()) sendUtterance(heardSoFar, bestConfidence);
+    else if (handsfree.checked) note("Didn't catch anything — say it again.");
   };
 
   recognition.onerror = (event) => {
@@ -233,15 +454,23 @@ function startListening() {
     note("Microphone error: " + event.error);
   };
 
+  // Accumulate finals; the turn is sent from onend, once OUR detector has
+  // decided it is over. Interim results are ignored except as proof the
+  // recogniser is still alive.
   recognition.onresult = (event) => {
-    const best = event.results[0][0];
-    // Chrome reports 0 for some results rather than omitting the field. A
-    // real zero and "not measured" are different things, and sending 0 would
-    // block every turn, so an absent or zero score travels as null -- the
-    // server treats null as unreported and lets the turn through.
-    const raw = best.confidence;
-    const confidence = (typeof raw === "number" && raw > 0) ? raw : null;
-    sendUtterance(best.transcript, confidence);
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      if (!result.isFinal) continue;
+      const best = result[0];
+      heardSoFar += (heardSoFar ? " " : "") + best.transcript;
+      // Chrome reports 0 for some results rather than omitting the field. A
+      // real zero and "not measured" are different things, and sending 0
+      // would block every turn, so an absent or zero score travels as null.
+      const raw = best.confidence;
+      if (typeof raw === "number" && raw > 0) {
+        bestConfidence = bestConfidence === null ? raw : Math.min(bestConfidence, raw);
+      }
+    }
   };
 
   recognition.start();
@@ -327,12 +556,20 @@ function connect() {
     // The machine decides the language; we follow it. It can change mid-call
     // when somebody asks to switch, and the voice has to follow with it.
     if (data.language) language = data.language;
+    if (data.turn) turnPolicy = data.turn;
     const voice = data.audio ? " &middot; sarvam voice" : "";
     bubble("agent", data.text, movement + understood + voice);
     recordState(data.state, data.moved);
 
     // Server audio when it came, the browser's own voice when it did not.
     if (!(data.audio && playFromServer(data.audio))) speak(data.text);
+
+    // Hands-free: listen again once the agent has stopped talking. Started
+    // after the reply rather than during it, so the first thing the detector
+    // measures is the room and not the agent's own voice.
+    if (handsfree.checked && !data.finished && canListen) {
+      waitForQuiet(() => { if (!listening) startListening(); });
+    }
 
     if (data.finished) {
       setLive(false, "session finished");
@@ -392,6 +629,10 @@ function sendUtterance(text, confidence) {
   // Omitted entirely when typed. Nobody mishears a keyboard, and the server
   // treats a missing field as certain rather than as zero.
   if (spoken) message.confidence = confidence;
+  // Only reported where the server said it matters -- barge-in is normal, and
+  // a row for every one of them is noise in the trail.
+  if (interruptedThisTurn && turnPolicy.report_interruption) message.interrupted = true;
+  interruptedThisTurn = false;
   socket.send(JSON.stringify(message));
   input.value = "";
 }
@@ -423,8 +664,22 @@ retry.addEventListener("click", () => {
 send.addEventListener("click", submit);
 input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
 
+// Poll rather than rely on an ended event, because the reply may be spoken by
+// the browser (speechSynthesis) or played as a file, and only one of those has
+// a reliable one.
+function waitForQuiet(then) {
+  const started = performance.now();
+  (function check() {
+    if (!agentIsTalking() || performance.now() - started > 20000) {
+      setTimeout(then, 250);   // a beat, so it does not feel like an interruption
+      return;
+    }
+    setTimeout(check, 120);
+  })();
+}
+
 mic.addEventListener("click", () => {
-  if (listening) { recognition.stop(); return; }
+  if (listening) { stopDetector(); recognition.stop(); return; }
   startListening();
 });
 

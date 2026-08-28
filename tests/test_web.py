@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.audit import InMemoryAuditSink
+from app.audit import AuditKind, InMemoryAuditSink
 from app.conversation import Conversation
 from app.flow.actions import Actions
 from app.flow.machine import Machine
@@ -543,3 +543,72 @@ def test_a_vendor_failure_still_returns_the_turn():
 
     assert opening["audio"] is None
     assert opening["text"], "the reply itself was lost"
+
+
+# ---------------------------------------------------------------------------
+# Turn-taking. The browser listens; the machine says how patiently.
+# ---------------------------------------------------------------------------
+
+
+def test_each_turn_carries_how_long_to_wait():
+    """Sent per turn because it changes with the state, and the page should
+    not have to know why."""
+    from app.flow.turn_taking import silence_ms
+
+    client, _ = build_client(Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"))
+    created = open_session(client)
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        opening = socket.receive_json()
+        assert opening["turn"]["silence_ms"] == silence_ms(State.LANGUAGE_SELECT)
+
+        socket.send_json({"utterance": "hindi", "confidence": 0.99})
+        at_consent = socket.receive_json()
+
+    # The window grows on arrival at the consent gate, without the page asking.
+    assert at_consent["state"] == str(State.CONSENT)
+    assert at_consent["turn"]["silence_ms"] == silence_ms(State.CONSENT)
+    assert at_consent["turn"]["silence_ms"] > opening["turn"]["silence_ms"]
+    assert at_consent["turn"]["report_interruption"] is True
+
+
+def test_talking_over_the_consent_notice_is_written_down():
+    """Not refused -- a person must be able to interrupt a machine. But DPDP
+    requires notice as well as consent, and "haan" four seconds into a
+    twenty-second explanation is a weak claim to have received it."""
+    client, registry = build_client(
+        Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"),
+        Classification(Event.CONSENT_GIVEN),
+    )
+    created = open_session(client)
+    audit = client.app.state.audit
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        socket.receive_json()
+        socket.send_json({"utterance": "hindi", "confidence": 0.99})
+        socket.receive_json()
+
+        socket.send_json({"utterance": "haan", "confidence": 0.99, "interrupted": True})
+        reply = socket.receive_json()
+
+    kinds = [r.kind for r in audit.for_session(created["session_id"])]
+    assert AuditKind.CALLER_INTERRUPTED in kinds
+
+    # And the turn still happened. The note is a note, not a refusal.
+    assert reply["moved"] is True
+
+
+def test_an_interruption_elsewhere_is_not_noise_in_the_trail():
+    """Barge-in is normal. Only the consent notice makes it material, or the
+    trail fills with rows nobody will ever ask about."""
+    client, _ = build_client(Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"))
+    created = open_session(client)
+    audit = client.app.state.audit
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        socket.receive_json()
+        socket.send_json({"utterance": "hindi", "confidence": 0.99, "interrupted": True})
+        socket.receive_json()
+
+    kinds = [r.kind for r in audit.for_session(created["session_id"])]
+    assert AuditKind.CALLER_INTERRUPTED not in kinds
