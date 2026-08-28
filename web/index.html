@@ -346,7 +346,28 @@ let detector = null;
 // micDiag(), because "it is listening but nothing happens" is not a
 // debuggable report and this turns it into numbers.
 let micState = null;
-function micDiag() { return micState; }
+
+// The recogniser's own story, which the audio diagnostic could not tell.
+// Chrome's SpeechRecognition opens its OWN microphone, separate from the
+// stream the detector uses, so "the detector heard nothing" and "the
+// recogniser heard nothing" are different failures with different fixes.
+let recogState = {
+  started: 0, results: 0, interim: 0, finals: 0, ended: 0,
+  lastError: null, lastTranscript: "",
+};
+
+function micDiag() {
+  return {
+    audio: micState,
+    recogniser: recogState,
+    listening,
+    heardSoFar,
+    policy: turnPolicy,
+    // The two questions that separate every remaining cause.
+    audioWorking: Boolean(micState && micState.framesSeen > 0),
+    recogniserWorking: recogState.results > 0,
+  };
+}
 window.micDiag = micDiag;
 let turnPolicy = { silence_ms: 1000, patience_ms: 12000, barge_in: true, report_interruption: false };
 let interruptedThisTurn = false;
@@ -483,7 +504,15 @@ let fallbackStop = null;
 function armFallbackStop() {
   clearTimeout(fallbackStop);
   fallbackStop = setTimeout(() => {
-    if (listening) { try { recognition.stop(); } catch (e) {} }
+    if (!listening) return;
+    // If nothing was ever finalised, keep the last interim rather than
+    // sending nothing. Chrome discards interims on stop(), and an
+    // approximate transcript beats a lost turn -- the confidence gate
+    // downstream is what decides whether it is good enough to act on.
+    if (!heardSoFar.trim() && recogState.lastTranscript) {
+      heardSoFar = recogState.lastTranscript;
+    }
+    try { recognition.stop(); } catch (e) {}
   }, turnPolicy.silence_ms + 400);   // a beat behind the VAD, so it defers
 }
 
@@ -509,6 +538,10 @@ function startListening() {
   heardSoFar = "";
   bestConfidence = null;
   interruptedThisTurn = false;
+  recogState = {
+    started: 0, results: 0, interim: 0, finals: 0, ended: 0,
+    lastError: null, lastTranscript: "",
+  };
 
   startDetector({
     onSpeechEnd: () => { try { recognition.stop(); } catch (e) {} },
@@ -520,12 +553,14 @@ function startListening() {
   });
 
   recognition.onstart = () => {
+    recogState.started++;
     listening = true;
     mic.classList.add("listening");
     mic.innerHTML = "&#9632; Listening…";
   };
 
   recognition.onend = () => {
+    recogState.ended++;
     listening = false;
     clearTimeout(fallbackStop);
     stopDetector();
@@ -536,21 +571,35 @@ function startListening() {
       sendUtterance(heardSoFar, bestConfidence);
     } else {
       note("Didn't catch anything — say it again.");
-      // Distinguish "you were quiet" from "the detector is deaf". Without
-      // this they look identical from the outside, which is how a suspended
-      // audio context stays hidden.
-      if (micState && micState.framesSeen > 10 && micState.voicedFrames === 0) {
+
+      // Name which half failed. From the outside a suspended audio context, a
+      // recogniser that never got audio, and somebody sitting quietly all
+      // look identical, and that is how this went round twice.
+      const audioAlive = micState && micState.framesSeen > 0;
+      const recogAlive = recogState.results > 0;
+
+      if (!audioAlive) {
+        note("The level meter never read a frame — the audio context is not "
+           + (micState ? micState.context : "started") + ". This is not you.");
+      } else if (micState.voicedFrames === 0) {
         note(
-          `Microphone read ${micState.framesSeen} frames and heard no speech ` +
-          `(peak ${micState.peakRms.toFixed(4)}, threshold ` +
-          `${(micState.floor * ENTER_MARGIN).toFixed(4)}). ` +
-          `Run micDiag() in the console.`
+          `Read ${micState.framesSeen} frames, none above the speech threshold `
+          + `(peak ${micState.peakRms.toFixed(4)} vs `
+          + `${(micState.floor * ENTER_MARGIN).toFixed(4)}). Either the mic is `
+          + `muted or the threshold is too high for this room.`
         );
       }
+      if (!recogAlive) {
+        note("Chrome's recogniser returned nothing"
+           + (recogState.lastError ? ` (${recogState.lastError})` : "")
+           + " — it may not have got the microphone.");
+      }
+      note("Run micDiag() in the console and send me what it prints.");
     }
   };
 
   recognition.onerror = (event) => {
+    recogState.lastError = event.error;
     if (event.error === "no-speech") { note("Didn't hear anything."); return; }
     if (event.error === "not-allowed") {
       note("Microphone blocked. Allow it in the address bar to speak.");
@@ -573,9 +622,24 @@ function startListening() {
   // first wins; if the VAD is healthy it always will, because it is watching
   // the audio rather than waiting on a recogniser that has already decided.
   recognition.onresult = (event) => {
+    recogState.results++;
+
+    // Armed on ANY result, interim included. This was finals-only, and with
+    // continuous=true Chrome frequently emits nothing final until stop() is
+    // called -- so the timer that was supposed to be the safety net never
+    // armed, and the VAD stayed the only thing that could end a turn. A
+    // safety net that depends on the thing it is protecting against is not
+    // one.
+    armFallbackStop();
+
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const result = event.results[i];
-      if (!result.isFinal) continue;
+      if (!result.isFinal) {
+        recogState.interim++;
+        recogState.lastTranscript = result[0].transcript;
+        continue;
+      }
+      recogState.finals++;
       const best = result[0];
       heardSoFar += (heardSoFar ? " " : "") + best.transcript;
       // Chrome reports 0 for some results rather than omitting the field. A
