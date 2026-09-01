@@ -63,6 +63,21 @@ TO_SARVAM: dict[str, str] = {"or-IN": "od-IN"}
 FROM_SARVAM: dict[str, str] = {v: k for k, v in TO_SARVAM.items()}
 
 
+def bare_media_type(media_type: str) -> str:
+    """Drop MIME parameters, because Sarvam matches the type string exactly.
+
+    MediaRecorder in Chrome always emits `audio/webm;codecs=opus`. Sarvam's
+    allow-list contains `audio/webm` and rejects the same type with its codec
+    named -- a 400 reading "Invalid file type: audio/webm;codecs=opus. Only
+    [... 'audio/webm' ...] are allowed", which is a confusing error to be told
+    while the wanted value is sitting in the list it prints.
+
+    Found only with real browser audio: every earlier test used WAV, which
+    carries no codec parameter, so nothing exercised this.
+    """
+    return media_type.split(";")[0].strip().lower()
+
+
 def to_vendor(code: str) -> str:
     return TO_SARVAM.get(code, code)
 
@@ -112,7 +127,7 @@ class SarvamSpeech:
     def transcribe(self, audio: Audio, language: str) -> Transcript:
         try:
             response = self.client.speech_to_text.transcribe(
-                file=("audio", audio.data, audio.media_type),
+                file=("audio", audio.data, bare_media_type(audio.media_type)),
                 model=self.stt_model,
                 language_code=to_vendor(language),
             )

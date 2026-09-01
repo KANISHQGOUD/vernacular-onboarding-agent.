@@ -26,7 +26,7 @@ from app.speech import (
     SpeechProvider,
     Transcript,
 )
-from app.speech.sarvam import from_vendor, to_vendor
+from app.speech.sarvam import bare_media_type, from_vendor, to_vendor
 
 # ---------------------------------------------------------------------------
 # The vocabulary.
@@ -471,3 +471,29 @@ def test_the_spend_report_is_arithmetic_not_a_guess(cached):
 
     cached.synthesize("x" * 10_000, "hi-IN")
     assert cached.spend.rupees_saved == pytest.approx(30.0)
+
+
+def test_the_codec_parameter_is_stripped_before_the_vendor_sees_it():
+    """Chrome's MediaRecorder always emits `audio/webm;codecs=opus`, and
+    Sarvam matches its allow-list by exact string -- so it rejects the very
+    type it lists, because of the parameter.
+
+    Every earlier test used WAV, which carries no codec parameter, so nothing
+    exercised this until real browser audio arrived.
+    """
+    assert bare_media_type("audio/webm;codecs=opus") == "audio/webm"
+    assert bare_media_type("audio/ogg; codecs=opus") == "audio/ogg"
+    assert bare_media_type("AUDIO/WAV") == "audio/wav"
+    assert bare_media_type("audio/wav") == "audio/wav"
+
+
+def test_recorded_browser_audio_reaches_the_vendor_with_a_type_it_accepts():
+    provider = fake_sarvam()
+    provider.transcribe(
+        Audio(bytes([0x1A, 0x45, 0xDF, 0xA3]), "audio/webm;codecs=opus"),
+        "hi-IN",
+    )
+
+    sent = provider.client.speech_to_text.calls[0]
+    _, _, media_type = sent["file"]
+    assert media_type == "audio/webm", "the codec parameter reached the vendor"
