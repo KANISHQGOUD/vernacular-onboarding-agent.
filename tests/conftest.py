@@ -65,5 +65,17 @@ def eligible_applicant(**overrides) -> EligibilityInput:
 
 
 def complete_applicant_data() -> dict[str, str]:
-    """Every field COLLECT_DATA requires, so the flow can leave that state."""
-    return {name: "provided" for name in REQUIRED_APPLICANT_FIELDS}
+    """Every field COLLECT_DATA requires, so the flow can leave that state.
+
+    Real-shaped values, not "provided" for everything. Once `fields.py`
+    validates what gets saved, a placeholder is no longer a neutral stand-in:
+    it is a mobile number with no digits in it, and the fixture would be
+    testing the rejection path everywhere by accident.
+    """
+    return {
+        "full_name": "Asha Devi",
+        "date_of_birth": "1990-01-01",
+        "address": "14 Gandhi Marg, Jaipur",
+        "occupation": "tailor",
+        "mobile": "9812345678",
+    }

@@ -35,10 +35,17 @@ the provider layer's.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 
 from app.flow.eligibility import EligibilityInput, Residency, evaluate
+from app.flow.fields import (
+    MAX_FIELD_ATTEMPTS,
+    FieldProblem,
+    normalised,
+    validate,
+)
 from app.audit import AuditKind
 from app.flow.machine import Machine
 from app.flow.states import Event, ToolName
@@ -50,6 +57,24 @@ from app.providers.payments import (
     PaymentResult,
 )
 from app.session import Session
+
+log = logging.getLogger(__name__)
+
+
+class FieldRejected(Exception):
+    """What we heard cannot be what they said.
+
+    Not a caller mistake and not a provider failure -- a recognition failure,
+    which is a third thing. The caller did nothing wrong and should not be
+    told they did; `attempts` lets the conversation escalate its wording, and
+    `problem` is phrased to be repeatable to them.
+    """
+
+    def __init__(self, field: str, problem: FieldProblem, attempts: int) -> None:
+        self.field = field
+        self.problem = problem
+        self.attempts = attempts
+        super().__init__(f"{field}: {problem}")
 
 
 class ActionRefused(Exception):
@@ -82,16 +107,60 @@ class Actions:
         session.consent_recorded = True
         return session
 
-    def save_applicant_field(self, session: Session, field_name: str, value: str) -> Session:
+    def save_applicant_field(
+        self,
+        session: Session,
+        field_name: str,
+        value: str,
+        *,
+        as_of: date,
+    ) -> Session:
         """Saving one field is an intent; having them all is a fact.
 
         So this writes without firing, and fires only when the required set is
         complete -- and that completeness is decided by comparing against
         REQUIRED_APPLICANT_FIELDS, never by asking the model whether it thinks
         it has enough.
+
+        VALIDATED FIRST, BUT NOT FOREVER
+        --------------------------------
+        A value that cannot be what they said is refused and re-asked, because
+        the provider reports no confidence and a rule that says "impossible"
+        is better evidence than a number that says "unsure".
+
+        After MAX_FIELD_ATTEMPTS it is stored anyway, flagged. Every rule in
+        fields.py is a guess about what a real answer looks like, and each is
+        wrong about somebody -- an unusual name, a number that does not fit
+        the Indian mobile shape. A flow whose entire purpose is not turning
+        people away must not invent a new way to turn them away, so the last
+        word belongs to the applicant and the flag belongs to whoever reviews
+        it.
         """
         self.machine.assert_tool_allowed(session, ToolName.SAVE_APPLICANT_FIELD)
-        session.applicant[field_name] = value
+
+        problem = validate(field_name, value, as_of=as_of)
+        if problem is not None:
+            attempts = session.field_attempts(field_name) + 1
+            session.notes[f"attempts:{field_name}"] = str(attempts)
+
+            if attempts < MAX_FIELD_ATTEMPTS:
+                raise FieldRejected(field_name, problem, attempts)
+
+            # Out of attempts. Their answer wins, and the trail says why.
+            log.warning(
+                "storing %s unvalidated after %s attempts: %s",
+                field_name,
+                attempts,
+                problem,
+            )
+            session.notes[f"unvalidated:{field_name}"] = str(problem)
+            self.machine.record(
+                session,
+                AuditKind.FIELD_UNVALIDATED,
+                detail=f"{field_name} stored after {attempts} attempts: {problem}",
+            )
+
+        session.applicant[field_name] = normalised(field_name, value)
 
         if session.required_data_complete:
             return self.machine.fire(session, Event.REQUIRED_DATA_COMPLETE)

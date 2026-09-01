@@ -33,7 +33,11 @@ from app.providers.payments import (
     PaymentFailure,
 )
 from app.session import Session
-from tests.conftest import AS_OF
+from tests.conftest import AS_OF, complete_applicant_data
+
+# Real-shaped values: fields.py validates what gets saved, so a
+# placeholder would exercise the rejection path by accident.
+VALUES = complete_applicant_data()
 
 GOOD_APPLICANT = dict(
     date_of_birth=date(1990, 1, 1),
@@ -71,7 +75,7 @@ def drive_to_kyc_pending(actions: Actions, session: Session) -> Session:
     # and asking a second time would be both rude and -- since the required set
     # would already be complete -- refused by the machine.
     for name in sorted(session.missing_fields):
-        actions.save_applicant_field(session, name, "provided")
+        actions.save_applicant_field(session, name, VALUES[name], as_of=AS_OF)
 
     actions.start_video_kyc(session)
     return session
@@ -217,7 +221,7 @@ def test_screening_carries_the_mobile_forward_so_it_is_not_asked_twice(rig):
     # And the machine advances on the last genuinely missing field, not on a
     # fixed count of tool calls.
     for name in sorted(session.missing_fields):
-        actions.save_applicant_field(session, name, "provided")
+        actions.save_applicant_field(session, name, VALUES[name], as_of=AS_OF)
 
     assert session.state is State.KYC_HANDOFF
 

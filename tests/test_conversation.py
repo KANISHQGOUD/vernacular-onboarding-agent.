@@ -507,3 +507,35 @@ def test_a_real_misunderstanding_still_says_say_that_again():
 
     assert reply.understood is False
     assert reply.text == SPEECH_ACTS[SpeechActKind.DID_NOT_UNDERSTAND].fallback
+
+
+def test_an_impossible_value_is_re_asked_without_blaming_them():
+    """The caller hears what was wrong with the VALUE, not with their speech.
+
+    They cannot fix a dropped digit by speaking more clearly -- recognition
+    failed, not them -- so `understood` stays True and the funnel does not
+    file this beside mumbles. Same distinction drawn for provider outages.
+    """
+    from datetime import date
+
+    from app.flow.states import State
+
+    conversation, session, _ = build(
+        Classification(Event.DATA_PROVIDED, "mobile", "98123"),
+        Classification(Event.DATA_PROVIDED, "mobile", "9812345678"),
+    )
+    conversation.as_of = date(2026, 9, 2)
+    session.state = State.COLLECT_DATA
+
+    rejected = conversation.respond(session, "my number is nine eight one two three")
+
+    assert "mobile" not in session.applicant, "an impossible value was stored"
+    assert rejected.moved is False
+    assert rejected.understood is True, "a bad digit is not a misunderstanding"
+    assert "10" in rejected.text and "mobile" in rejected.text.lower()
+    for blame in ("clearly", "slowly", "didn't catch", "did not catch"):
+        assert blame not in rejected.text.lower()
+
+    # And saying it properly still works -- the refusal is not a dead end.
+    conversation.respond(session, "nine eight one two three four five six seven eight")
+    assert session.applicant["mobile"] == "9812345678"

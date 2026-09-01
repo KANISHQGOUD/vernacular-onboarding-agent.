@@ -194,7 +194,7 @@ def _drive_full_journey(actions: Actions, session: Session) -> Session:
         as_of=AS_OF,
     )
     for name in sorted(session.missing_fields):
-        actions.save_applicant_field(session, name, PERSONAL_VALUES[name])
+        actions.save_applicant_field(session, name, PERSONAL_VALUES[name], as_of=AS_OF)
     actions.start_video_kyc(session)
     actions.check_kyc_status(session)
     actions.open_account(session)

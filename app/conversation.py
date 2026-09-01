@@ -40,7 +40,7 @@ from datetime import date
 from typing import Callable, Mapping
 
 from app.audit import AuditKind
-from app.flow.actions import ActionRefused, Actions
+from app.flow.actions import ActionRefused, Actions, FieldRejected
 from app.flow.eligibility import DeclineReason, Residency
 from app.flow.intents import UntrustedEventError
 from app.flow.machine import FlowError
@@ -207,7 +207,10 @@ class Conversation:
             log.info("refused %s in %s", reading.intent, before)
             return self._reply(session, moved=False, understood=False)
 
-        self._record_after_moving(session, reading)
+        rejected = self._record_after_moving(session, reading)
+        if rejected is not None:
+            return self._rejected_reply(session, rejected)
+
         self._advance(session)
         return self._reply(session, moved=session.state is not before, understood=True)
 
@@ -233,12 +236,33 @@ class Conversation:
         if reading.intent is Event.CONSENT_GIVEN and session.state is State.CONSENT:
             self.actions.record_consent(session)
 
-    def _record_after_moving(self, session: Session, reading: Classification) -> None:
+    def _record_after_moving(
+        self, session: Session, reading: Classification
+    ) -> FieldRejected | None:
+        """Returns the rejection, if the value could not be what they said.
+
+        Returned rather than stored, because this class holds no per-turn
+        state -- and a rejection is very much per-turn.
+        """
         if reading.carries_data and session.state is State.COLLECT_DATA:
             try:
-                self.actions.save_applicant_field(session, reading.field, reading.value)
+                self.actions.save_applicant_field(
+                    session, reading.field, reading.value, as_of=self.as_of
+                )
+            except FieldRejected as rejected:
+                # Not an error and not their mistake: recognition produced
+                # something impossible. The caller is asked again, with the
+                # reason, and the machine has not moved.
+                log.info(
+                    "rejected %s (attempt %s): %s",
+                    rejected.field,
+                    rejected.attempts,
+                    rejected.problem,
+                )
+                return rejected
             except FlowError:
                 log.info("could not save %s in %s", reading.field, session.state)
+        return None
 
     # -- Step 4: what the state requires, deterministically ------------------
 
@@ -275,6 +299,30 @@ class Conversation:
                 return
 
     # -- Step 5: what the state says ----------------------------------------
+
+    def _rejected_reply(self, session: Session, rejected: FieldRejected) -> Reply:
+        """Ask again, saying what was wrong with the VALUE.
+
+        `understood=True` on purpose: we read them correctly, and what came
+        back could not be right. Filing this beside "did not understand" would
+        make the funnel blame the caller for a recognition failure -- the same
+        conflation undone for provider outages in an earlier commit.
+        """
+        return Reply(
+            text=self.phraser.say(
+                SpeechAct(
+                    kind=SpeechActKind.FIELD_NOT_USABLE,
+                    language=session.language or DEFAULT_LANGUAGE,
+                    data={
+                        "field_label": FIELD_LABELS.get(rejected.field, "answer"),
+                        "problem_text": str(rejected.problem),
+                    },
+                )
+            ),
+            state=session.state,
+            moved=False,
+            understood=True,
+        )
 
     def _reply(self, session: Session, *, moved: bool, understood: bool) -> Reply:
         act = (

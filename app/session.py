@@ -72,6 +72,18 @@ class Session:
     def eligibility_passed(self) -> bool:
         return self.eligibility is not None and self.eligibility.passed
 
+    def field_attempts(self, field_name: str) -> int:
+        """How many times this field has been rejected already.
+
+        In `notes` rather than a field of its own, for the same reason
+        `lapses` is: it describes the conversation, not the person, so it
+        survives `erase_personal_data()` and stays answerable afterwards.
+        """
+        try:
+            return int(self.notes.get(f"attempts:{field_name}", "0"))
+        except ValueError:
+            return 0
+
     @property
     def lapses(self) -> int:
         """How many times this session went quiet and came back.

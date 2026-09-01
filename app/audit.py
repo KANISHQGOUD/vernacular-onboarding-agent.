@@ -44,6 +44,11 @@ class AuditKind(StrEnum):
     # because "how often did our vendor fail a caller" is an operational
     # question, and folding it into "not understood" answers it as zero.
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    # A value stored despite failing its rule, because the applicant said it
+    # three times and the rule is the thing more likely to be wrong. Counted
+    # so a rule that fires constantly can be found and fixed, rather than
+    # quietly taxing a population it was never written for.
+    FIELD_UNVALIDATED = "FIELD_UNVALIDATED"
 
 
 @dataclass(frozen=True, slots=True)

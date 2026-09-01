@@ -57,6 +57,7 @@ class SpeechActKind(StrEnum):
     ACKNOWLEDGE_NO_CONSENT = "ACKNOWLEDGE_NO_CONSENT"
     ACKNOWLEDGE_STOPPED = "ACKNOWLEDGE_STOPPED"
     ADMIT_OUR_FAULT = "ADMIT_OUR_FAULT"
+    FIELD_NOT_USABLE = "FIELD_NOT_USABLE"
     HANDING_TO_HUMAN = "HANDING_TO_HUMAN"
     DID_NOT_UNDERSTAND = "DID_NOT_UNDERSTAND"
 
@@ -148,6 +149,18 @@ SPEECH_ACTS: Mapping[SpeechActKind, SpeechActSpec] = MappingProxyType(
                     "Sorry — something isn't working on our side just now. "
                     "That's not you. Please try again in a moment."
                 ),
+            ),
+            SpeechActSpec(
+                kind=SpeechActKind.FIELD_NOT_USABLE,
+                intent=(
+                    "What you heard for field_label cannot be right -- the "
+                    "reason is in problem_text. Say what went wrong with the "
+                    "VALUE, not with them, and ask for it again. Do NOT say "
+                    "they were unclear, did not speak properly, or should try "
+                    "harder: recognition failed, and they have no way to fix "
+                    "that by speaking differently."
+                ),
+                fallback="Sorry, {problem_text}. Could you tell me your {field_label} again?",
             ),
             SpeechActSpec(
                 kind=SpeechActKind.ANNOUNCE_DECLINE,
