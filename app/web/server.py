@@ -65,7 +65,7 @@ from app.llm.phrasing import Phraser
 from app.providers.core_banking import MockCoreBanking
 from app.providers.kyc import MockKycProvider
 from app.providers.payments import MockPaymentRail
-from app.speech import CachedSpeech, SarvamSpeech, SpeechProvider
+from app.speech import Audio, CachedSpeech, SarvamSpeech, SpeechProvider
 from app.web.registry import SessionRegistry
 
 # The CLI loaded this and the server did not, so uvicorn came up with no key
@@ -84,6 +84,10 @@ MAX_UTTERANCE_LENGTH = 500
 CLOSE_UNAUTHORISED = 1008
 
 WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "web"
+
+# Read once at import: a flag that changed under a running server would
+# put the page and the socket into different modes mid-conversation.
+SERVER_STT = os.getenv("SARVAM_STT", "").strip() == "1"
 
 
 def build_conversation(audit: InMemoryAuditSink) -> Conversation:
@@ -134,7 +138,7 @@ def build_speech() -> SpeechProvider | None:
     So the arrangement that is cheapest is also the one that keeps the consent
     gate working. That is a coincidence, but a welcome one.
     """
-    if os.getenv("SARVAM_TTS", "").strip() != "1":
+    if os.getenv("SARVAM_TTS", "").strip() != "1" and os.getenv("SARVAM_STT", "").strip() != "1":
         return None
 
     key = os.getenv("SARVAM_API_KEY", "").strip()
@@ -144,8 +148,27 @@ def build_speech() -> SpeechProvider | None:
 
     # Cached, always. Every fallback is a fixed literal and the consent notice
     # is spoken in every call; paying twice for identical audio is a choice.
+    # (Only synthesis is cached -- see app/speech/cache.py on why transcription
+    # never can be.)
     log.info("server-side speech: Sarvam, cached")
     return CachedSpeech(inner=SarvamSpeech(api_key=key))
+
+
+def server_transcription_enabled() -> bool:
+    """Whether the page should send audio instead of its own transcript.
+
+    Chrome's SpeechRecognition is free and reports confidence, which is why it
+    is the default. But it depends on Google's speech service being reachable
+    from the browser, and when that fails it fails SILENTLY -- no error, no
+    results, a microphone that is plainly working and a page that receives
+    nothing. Observed on a real machine, which is why this exists.
+
+    Sarvam is the fallback and, for this product, arguably the better path
+    anyway: it is trained on Indian accents and code-mixing, where Chrome's
+    generic hi-IN is weakest. The cost is real -- roughly Rs 0.008 per second
+    of audio -- so it is opt-in rather than automatic.
+    """
+    return os.getenv("SARVAM_STT", "").strip() == "1"
 
 
 def build_storage() -> tuple[SessionRegistry, object]:
@@ -172,11 +195,28 @@ def build_storage() -> tuple[SessionRegistry, object]:
         open_pool,
     )
 
+    # Reachable? A pool opens lazily enough that an unreachable database
+    # becomes a 500 on the first session instead of a problem at startup --
+    # and a 500 on session creation means no socket, which means the caller
+    # cannot say anything at all. Everywhere else here a failing dependency
+    # degrades rather than removing the capability; storage should too.
+    try:
+        pool = open_pool(url)
+        with pool.connection() as probe:
+            probe.execute("SELECT 1")
+    except Exception:  # noqa: BLE001 - any failure to reach it means the same
+        log.warning(
+            "DATABASE_URL is set but the database is unreachable -- falling "
+            "back to memory. Sessions will not survive a restart. Start it "
+            "with: docker start onboarding-db",
+            exc_info=True,
+        )
+        return SessionRegistry(), InMemoryAuditSink()
+
     log.info("using Postgres for sessions and the audit trail")
     # One pool, shared by all three stores. Three pools would triple the idle
     # connections for no benefit -- they are backed by the same database and
     # a connection does not care which store borrowed it.
-    pool = open_pool(url)
     registry = SessionRegistry(
         store=PostgresSessionStore(pool),
         tokens=PostgresTokenStore(pool),
@@ -276,6 +316,31 @@ def create_app(
             while True:
                 message = await socket.receive_json()
                 utterance = (message or {}).get("utterance", "")
+
+                # Audio instead of a transcript, when the page could not get
+                # one itself. Transcribed here rather than in the browser, so
+                # a machine whose Chrome cannot reach Google's speech service
+                # is still able to hold a conversation.
+                clip = (message or {}).get("audio")
+                if clip and speech is not None and not utterance.strip():
+                    try:
+                        heard = speech.transcribe(
+                            Audio(
+                                data=base64.b64decode(clip),
+                                media_type=(message or {}).get(
+                                    "audio_type", "audio/webm"
+                                ),
+                            ),
+                            loaded.language or DEFAULT_LANGUAGE,
+                        )
+                        utterance = heard.text
+                        log.info("transcribed %s bytes -> %r", len(clip), utterance)
+                    except Exception:  # noqa: BLE001 - a vendor failing is not fatal
+                        log.warning("server-side transcription failed", exc_info=True)
+                        await socket.send_json(
+                            {"error": "could not hear that, please try again"}
+                        )
+                        continue
 
                 if not isinstance(utterance, str) or not utterance.strip():
                     await socket.send_json({"error": "empty utterance"})
@@ -396,6 +461,10 @@ def _payload(reply, session, speech: SpeechProvider | None = None) -> dict:
         # per turn because it changes with the state, and the page should not
         # have to know why -- see app/flow/turn_taking.py.
         "turn": policy_for(session.state),
+        # Whether the page should send audio for us to transcribe, rather than
+        # relying on Chrome's recogniser. The server knows; the page should
+        # not have to be configured separately and drift.
+        "server_stt": SERVER_STT,
     }
 
 

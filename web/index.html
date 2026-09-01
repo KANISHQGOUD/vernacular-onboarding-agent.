@@ -146,6 +146,9 @@ let player = null;   // the <audio> playing a server-synthesised reply
 let heardSoFar = "";
 let bestConfidence = null;
 let sawAnyResult = false;
+// Set by the server. When true the page records audio and sends it for
+// transcription instead of relying on Chrome's recogniser.
+let serverStt = false;
 // The machine chooses the language and tells us. The browser never guesses it:
 // re-detecting per utterance would let one mumbled sentence switch somebody
 // into a language they cannot read.
@@ -380,6 +383,73 @@ function agentIsTalking() {
          (canSpeak && window.speechSynthesis.speaking);
 }
 
+// Reads a stream somebody else opened, so the recorder and the meter share
+// one capture. `startDetector` keeps its own getUserMedia for the Chrome path.
+function startMeterOn(stream, onSpeechEnd) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === "suspended") ctx.resume().catch(() => {});
+
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  ctx.createMediaStreamSource(stream).connect(analyser);
+
+  const frame = new Float32Array(analyser.fftSize);
+  const startedAt = performance.now();
+  const ambient = [];
+  let floor = MIN_THRESHOLD, speechStartedAt = 0, lastVoiceAt = 0, sawSpeech = false;
+
+  micState = {
+    context: ctx.state, sampleRate: ctx.sampleRate,
+    track: (stream.getAudioTracks()[0] || {}).label || "unknown",
+    peakRms: 0, floor: null, framesSeen: 0, voicedFrames: 0,
+  };
+
+  const timer = setInterval(() => {
+    analyser.getFloatTimeDomainData(frame);
+    let sum = 0;
+    for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+    const rms = Math.sqrt(sum / frame.length);
+    const now = performance.now();
+
+    if (now - startedAt < CALIBRATION_MS) { ambient.push(rms); return; }
+    if (ambient.length) {
+      const sorted = [...ambient].sort((a, b) => a - b);
+      floor = Math.min(Math.max(sorted[Math.floor(sorted.length * 0.2)] || 0, MIN_THRESHOLD), MAX_THRESHOLD);
+      ambient.length = 0;
+    }
+
+    const voice = isVoiced(rms, floor, sawSpeech && (now - lastVoiceAt) < 300);
+    micState.framesSeen++; micState.floor = floor;
+    if (rms > micState.peakRms) micState.peakRms = rms;
+    if (voice) micState.voicedFrames++;
+
+    level.style.width = Math.min(100, (rms / (floor * ENTER_MARGIN * 2)) * 100) + "%";
+    meter.classList.toggle("voice", voice);
+
+    if (voice) {
+      if (!sawSpeech) {
+        sawSpeech = true;
+        speechStartedAt = now;
+        if (agentIsTalking()) { interruptedThisTurn = true; stopSpeaking(); }
+      }
+      lastVoiceAt = now;
+    }
+
+    const verdict = turnVerdict({
+      sawSpeech, speechStartedAt, lastVoiceAt, startedAt, now,
+      silenceMs: turnPolicy.silence_ms,
+      patienceMs: turnPolicy.patience_ms,
+      minSpeechMs: MIN_SPEECH_MS,
+    });
+    if (verdict !== "listening") { stopMeter(); onSpeechEnd(); }
+  }, TICK_MS);
+
+  meterHandle = { stop() { clearInterval(timer); ctx.close().catch(() => {}); level.style.width = "0%"; meter.classList.remove("voice"); } };
+}
+
+let meterHandle = null;
+function stopMeter() { if (meterHandle) { meterHandle.stop(); meterHandle = null; } }
+
 async function startDetector({ onSpeechEnd, onGaveUp }) {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -524,7 +594,105 @@ function stopDetector() {
   if (detector) { detector.stop(); detector = null; }
 }
 
+// ---------------------------------------------------------------------------
+// Recording, for when Chrome's recogniser cannot be used.
+//
+// Chrome's SpeechRecognition sends audio to Google's speech service, and when
+// that is unreachable it fails SILENTLY: no error, no results, a microphone
+// that is plainly working and a page that receives nothing. Observed on a real
+// machine, and undiagnosable from inside the page -- which is why this path
+// exists rather than more instrumentation.
+//
+// Here the browser only captures. Transcription happens on the server, with
+// the same vendor that already does synthesis, and one getUserMedia stream
+// feeds both the recorder and the level meter -- so nothing competes for the
+// microphone the way two recognisers did.
+// ---------------------------------------------------------------------------
+function pickMimeType() {
+  const wanted = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  for (const type of wanted) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return "";
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = reject;
+    // readAsDataURL gives "data:<type>;base64,<payload>"; the server wants
+    // only the payload.
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function recordTurn() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+
+  const mimeType = pickMimeType();
+  const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  const chunks = [];
+  let sent = false;
+
+  recorder.ondataavailable = (event) => {
+    if (event.data && event.data.size) chunks.push(event.data);
+  };
+
+  recorder.onstop = async () => {
+    stopMeter();
+    stream.getTracks().forEach((t) => t.stop());
+    listening = false;
+    mic.classList.remove("listening");
+    mic.innerHTML = "&#127908; Speak";
+
+    const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+    // Under about 1KB is a click or a cough, not a turn. Sending it costs
+    // money and returns nothing useful.
+    if (sent || blob.size < 1200) {
+      note("Didn't catch anything — say it again.");
+      return;
+    }
+    sent = true;
+
+    const payload = { audio: await blobToBase64(blob), audio_type: blob.type };
+    if (interruptedThisTurn && turnPolicy.report_interruption) payload.interrupted = true;
+    interruptedThisTurn = false;
+
+    bubble("you", "…", `sent ${(blob.size / 1024).toFixed(0)} KB for transcription`);
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+  };
+
+  // The same stream drives the meter and the endpoint decision. One capture,
+  // two readers, no competition.
+  startMeterOn(stream, () => {
+    if (recorder.state === "recording") recorder.stop();
+  });
+
+  listening = true;
+  mic.classList.add("listening");
+  mic.innerHTML = "&#9632; Listening…";
+  recorder.start();
+
+  // Hard stop, so a detector that never fires cannot listen forever.
+  setTimeout(() => {
+    if (recorder.state === "recording") recorder.stop();
+  }, turnPolicy.patience_ms);
+}
+
 function startListening() {
+  if (serverStt) {
+    recordTurn().catch((err) => {
+      listening = false;
+      mic.classList.remove("listening");
+      mic.innerHTML = "&#127908; Speak";
+      note("Microphone unavailable: " + err.name);
+    });
+    return;
+  }
+
   if (!canListen || listening) return;
 
   // Stop talking before listening, or the microphone hears the agent and
@@ -768,6 +936,7 @@ function connect() {
     // when somebody asks to switch, and the voice has to follow with it.
     if (data.language) language = data.language;
     if (data.turn) turnPolicy = data.turn;
+    if (typeof data.server_stt === "boolean") serverStt = data.server_stt;
     const voice = data.audio ? " &middot; sarvam voice" : "";
     bubble("agent", data.text, movement + understood + voice);
     recordState(data.state, data.moved);
@@ -890,7 +1059,11 @@ function waitForQuiet(then) {
 }
 
 mic.addEventListener("click", () => {
-  if (listening) { stopDetector(); recognition.stop(); return; }
+  if (listening) {
+    stopDetector(); stopMeter();
+    if (recognition) { try { recognition.stop(); } catch (e) {} }
+    return;
+  }
   startListening();
 });
 
