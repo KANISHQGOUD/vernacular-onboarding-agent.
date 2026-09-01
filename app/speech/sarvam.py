@@ -43,7 +43,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.speech.provider import Audio, SpeechError, Transcript
+from app.speech.provider import Audio, Expectation, SpeechError, Transcript
 
 log = logging.getLogger(__name__)
 
@@ -124,13 +124,25 @@ class SarvamSpeech:
 
     # -- Speech in ----------------------------------------------------------
 
-    def transcribe(self, audio: Audio, language: str) -> Transcript:
+    def transcribe(
+        self,
+        audio: Audio,
+        language: str,
+        expect: Expectation = Expectation.PLAIN,
+    ) -> Transcript:
+        # `codemix` is Sarvam's name for it; the caller says CODE_MIXED and
+        # does not have to know that. The next provider will spell it
+        # differently or not have it at all.
+        kwargs: dict[str, Any] = {
+            "file": ("audio", audio.data, bare_media_type(audio.media_type)),
+            "model": self.stt_model,
+            "language_code": to_vendor(language),
+        }
+        if expect is Expectation.CODE_MIXED:
+            kwargs["mode"] = "codemix"
+
         try:
-            response = self.client.speech_to_text.transcribe(
-                file=("audio", audio.data, bare_media_type(audio.media_type)),
-                model=self.stt_model,
-                language_code=to_vendor(language),
-            )
+            response = self.client.speech_to_text.transcribe(**kwargs)
         except Exception as exc:  # noqa: BLE001 - the vendor's tree is wide
             raise SpeechError(f"sarvam transcription failed: {exc}") from exc
 

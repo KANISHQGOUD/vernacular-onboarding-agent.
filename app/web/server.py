@@ -55,7 +55,7 @@ from app.audit import AuditKind, InMemoryAuditSink
 from app.conversation import Conversation
 from app.flow.actions import Actions
 from app.flow.machine import Machine
-from app.flow.hearing import is_confident_enough
+from app.flow.hearing import expectation_for, is_confident_enough
 from app.flow.turn_taking import interruption_matters, policy_for
 from app.flow.states import TERMINAL_STATES, State
 from app.llm.classifier import GeminiIntentClassifier, OfflineClassifier
@@ -332,6 +332,10 @@ def create_app(
                                 ),
                             ),
                             loaded.language or DEFAULT_LANGUAGE,
+                            # The machine knows it is asking for a name rather
+                            # than for a sentence, so the recogniser can be
+                            # told. See app/flow/hearing.py.
+                            expectation_for(loaded.state),
                         )
                         utterance = heard.text
                         log.info("transcribed %s bytes -> %r", len(clip), utterance)

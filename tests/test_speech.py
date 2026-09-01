@@ -26,6 +26,7 @@ from app.speech import (
     SpeechProvider,
     Transcript,
 )
+from app.speech.provider import Expectation
 from app.speech.sarvam import bare_media_type, from_vendor, to_vendor
 
 # ---------------------------------------------------------------------------
@@ -497,3 +498,61 @@ def test_recorded_browser_audio_reaches_the_vendor_with_a_type_it_accepts():
     sent = provider.client.speech_to_text.calls[0]
     _, _, media_type = sent["file"]
     assert media_type == "audio/webm", "the codec parameter reached the vendor"
+
+
+# ---------------------------------------------------------------------------
+# The conversation's language is not the utterance's language.
+# ---------------------------------------------------------------------------
+
+
+def test_collecting_a_name_expects_english_inside_the_sentence():
+    """People say their own name, their street, their job in English while
+    speaking Hindi. "मेरा नाम Steve है" is ordinary, not exotic."""
+    from app.flow.hearing import expectation_for
+
+    assert expectation_for(State.COLLECT_DATA) is Expectation.CODE_MIXED
+
+    # Everywhere else the vendor's normalisation is wanted: a spoken amount
+    # arriving as Rs 500 is easier to extract from, not harder.
+    for state in (State.CONSENT, State.LANGUAGE_SELECT, State.FUNDING):
+        assert expectation_for(state) is Expectation.PLAIN
+
+
+def test_the_expectation_reaches_the_vendor_as_its_own_setting():
+    """`codemix` is Sarvam's spelling. The caller says CODE_MIXED and never
+    learns that -- the next provider will spell it differently."""
+    provider = fake_sarvam()
+    clip = Audio(b"x", "audio/wav")
+
+    provider.transcribe(clip, "hi-IN", Expectation.CODE_MIXED)
+    assert provider.client.speech_to_text.calls[0].get("mode") == "codemix"
+
+    provider.transcribe(clip, "hi-IN", Expectation.PLAIN)
+    assert "mode" not in provider.client.speech_to_text.calls[1]
+
+
+def test_the_language_is_never_handed_over_to_the_vendor_to_guess():
+    """Measured, and the reason auto-detect is not used.
+
+    With language_code='unknown' the same clip came back as `Ashadevi Rathod`
+    instead of `आशा देवी राठौड़` -- it detected en-IN and romanised the whole
+    thing, merging the given name into the surname. A bank record whose script
+    depends on which way a detector guessed is worse than one that is
+    occasionally misspelled.
+    """
+    provider = fake_sarvam()
+    provider.transcribe(Audio(b"x", "audio/wav"), "hi-IN", Expectation.CODE_MIXED)
+
+    sent = provider.client.speech_to_text.calls[0]
+    assert sent["language_code"] == "hi-IN"
+    assert sent["language_code"] != "unknown"
+
+
+def test_the_cache_passes_the_expectation_through():
+    """It wraps a provider; swallowing an argument would silently downgrade
+    every collected field to the wrong mode."""
+    inner = MockSpeech()
+    cache = CachedSpeech(inner=inner)
+
+    cache.transcribe(Audio(b"x", "audio/wav"), "hi-IN", Expectation.CODE_MIXED)
+    assert inner.expected == [Expectation.CODE_MIXED]

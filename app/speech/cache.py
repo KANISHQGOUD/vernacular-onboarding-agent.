@@ -35,7 +35,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.speech.provider import Audio, SpeechProvider, Transcript
+from app.speech.provider import Audio, Expectation, SpeechProvider, Transcript
 
 log = logging.getLogger(__name__)
 
@@ -124,9 +124,14 @@ class CachedSpeech:
 
         return audio
 
-    def transcribe(self, audio: Audio, language: str) -> Transcript:
+    def transcribe(
+        self,
+        audio: Audio,
+        language: str,
+        expect: Expectation = Expectation.PLAIN,
+    ) -> Transcript:
         """Never cached. See the module docstring."""
-        return self.inner.transcribe(audio, language)
+        return self.inner.transcribe(audio, language, expect)
 
     # -- Warming ------------------------------------------------------------
 

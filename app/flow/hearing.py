@@ -41,6 +41,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from app.flow.states import State
+from app.speech.provider import Expectation
 
 # Applied where a state has no entry of its own. Deliberately middling: low
 # enough not to block ordinary speech, high enough to catch a recogniser that
@@ -64,6 +65,32 @@ CONFIDENCE_FLOOR: Mapping[State, float] = MappingProxyType(
         State.COLLECT_DATA: 0.35,
     }
 )
+
+
+# Where the answer is a proper noun rather than a sentence. People give
+# names, streets and occupations in English constantly while speaking Hindi --
+# "मेरा नाम Steve है" is not unusual, it is ordinary -- and a recogniser told
+# to expect pure Hindi transliterates it into Devanagari, or worse, guesses.
+#
+# Measured on this project's corpus: code-mix mode kept `account` as
+# `account`, and spelled आशा देवी राठौड़ correctly where the default produced
+# राठौर. Better on both halves of the problem, so it is not a trade.
+CODE_MIXED_STATES: frozenset[State] = frozenset({State.COLLECT_DATA})
+
+
+def expectation_for(state: State) -> Expectation:
+    """What kind of speech to tell the recogniser to expect.
+
+    Deliberately NOT "detect the language". Letting the vendor auto-detect
+    flips the output script entirely -- the same applicant comes back as
+    आशा देवी राठौड़ or as Ashadevi Rathod depending on which way it guessed,
+    and a bank record whose script depends on a coin toss is worse than one
+    that is occasionally misspelled. The conversation's language stays the
+    language; only the expectation of English *inside* it changes.
+    """
+    if state in CODE_MIXED_STATES:
+        return Expectation.CODE_MIXED
+    return Expectation.PLAIN
 
 
 def floor_for(state: State) -> float:

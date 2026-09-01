@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 # Below this, a float is almost certainly a mistake -- a percentage that was
@@ -45,6 +46,29 @@ from typing import Protocol, runtime_checkable
 # because a confidence of 87.0 silently passes every floor in hearing.py.
 MAX_CONFIDENCE = 1.0
 MIN_CONFIDENCE = 0.0
+
+
+class Expectation(StrEnum):
+    """What kind of speech is coming, so a recogniser can be told.
+
+    Not a vendor setting. A recogniser given no expectation guesses, and its
+    guess is tuned for continuous prose -- which is the wrong prior for a
+    two-word answer that happens to be somebody's surname.
+
+    PLAIN       ordinary speech in the conversation's language. Vendor
+                normalisation is welcome here: "पाँच सौ रुपये" arriving as
+                Rs 500 is easier to extract from, not harder.
+
+    CODE_MIXED  the answer may contain English inside the sentence, which is
+                how people actually speak and is near-universal for names,
+                street names and occupations. Measured on this project's own
+                corpus: it preserves `account` as `account` instead of
+                transliterating to `अकाउंट`, AND spelled an uncommon surname
+                correctly (राठौड़) where the default got it wrong (राठौर).
+    """
+
+    PLAIN = "PLAIN"
+    CODE_MIXED = "CODE_MIXED"
 
 
 class SpeechError(RuntimeError):
@@ -114,7 +138,12 @@ class SpeechProvider(Protocol):
 
     name: str
 
-    def transcribe(self, audio: Audio, language: str) -> Transcript: ...
+    def transcribe(
+        self,
+        audio: Audio,
+        language: str,
+        expect: Expectation = Expectation.PLAIN,
+    ) -> Transcript: ...
 
     def synthesize(self, text: str, language: str) -> Audio: ...
 
@@ -140,8 +169,15 @@ class MockSpeech:
 
     _heard_index: int = 0
     spoken: list[tuple[str, str]] = field(default_factory=list)
+    expected: list[Expectation] = field(default_factory=list)
 
-    def transcribe(self, audio: Audio, language: str) -> Transcript:
+    def transcribe(
+        self,
+        audio: Audio,
+        language: str,
+        expect: Expectation = Expectation.PLAIN,
+    ) -> Transcript:
+        self.expected.append(expect)
         if self._heard_index < len(self.hears):
             scripted = self.hears[self._heard_index]
             self._heard_index += 1
