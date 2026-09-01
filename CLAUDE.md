@@ -47,6 +47,21 @@ dormant account this exists to prevent, and the state machine says so.
 - **`session.applicant` is regulated PII; `session.notes` is operational
   metadata.** Split so `erase_personal_data()` deletes the person and keeps
   the trail.
+- **Personal data never reaches a log line.** A log file is the one store
+  with no erasure story: outside `erase_personal_data()`, and outside the
+  audit trail, whose every `detail=` is structural precisely so an
+  append-only log can coexist with a deletion request. Three tests pin it —
+  the classifier, the phraser, and the server-side transcription path. The
+  third exists because a debug line added while chasing a microphone bug put
+  the caller's full transcript in the log at INFO, and passed 1052 tests:
+  nothing had ever checked application logs.
+- **The socket refuses before it spends.** Terminal state, then the size
+  caps, then anything that reaches a vendor — the order of the checks in
+  `app/web/server.py` is load-bearing, not incidental. `MAX_AUDIO_BYTES` is
+  derived from `DEFAULT_PATIENCE_MS` rather than picked, and is deliberately
+  loose: a ceiling on abuse, not a fit to real speech. A cap tuned to
+  Chrome's exact bitrate would start refusing honest callers on some browser
+  nobody tested.
 - **The audit trail is append-only, enforced by the database** — a trigger
   rejects UPDATE, DELETE *and* TRUNCATE for every role including the owner.
   `Machine.record()` writes non-transition facts and refuses the transition
@@ -117,16 +132,16 @@ and spends one request from a 20/day quota.
 
 ## Current state
 
-Branch `master`, 40 commits, tree clean.
+Branch `master`, 42 commits, tree clean.
 
-**1052 tests pass, ~6s.** 1030 need no network and no keys; 22 need Postgres.
+**1055 tests pass, ~6s.** 1033 need no network and no keys; 22 need Postgres.
 One more is skipped by default: the live Sarvam round trip, which runs only
 under `SARVAM_LIVE=1` because it spends prepaid credit.
 
 | | count |
 |---|---|
 | states / events / tools | 15 / 19 / 10 |
-| transition rows / terminal states | 45 / 5 |
+| transition rows / terminal states | 49 / 5 |
 | speech acts / audit kinds / languages | 19 / 10 / 11 |
 
 Terminal states: `COMPLETED`, `DECLINED`, `CONSENT_REFUSED`, `ABANDONED`,
@@ -356,9 +371,11 @@ whole design exists to move.
   The endpoint *windows* in `app/flow/turn_taking.py` are reasoned from the
   product, not measured against recordings of people hesitating.
 
-  Silero VAD does not fit this topology and was not used -- it runs
-  server-side on audio frames, and the server never receives audio because
-  recognition happens in the browser.
+  Silero VAD was not used, and the reason has since narrowed. It runs
+  server-side on audio frames, and on the free path the server never sees any
+  -- recognition happens in the browser. Under `SARVAM_STT=1` the server does
+  receive clips, so the option is open there; it is still shut on the path
+  that has to work without a key, which is the one that has to work.
 - **The WER comparison needs recordings.** `scripts/wer.py` is built and
   tested; it has only ever run against synthesised audio, which proves the
   harness and nothing about accuracy. It needs real speakers.
@@ -368,6 +385,11 @@ whole design exists to move.
   the first run scored 150.6% WER for an engine that misheard nothing. An
   engine that normalises is penalised against one that does not, which means
   a naive table recommends the worse recogniser.
+- **`--ws-max-size` is what bounds memory, and nothing sets it.**
+  `receive_json()` reads the whole frame before `MAX_AUDIO_BYTES` can see it,
+  so uvicorn's 16 MB default is the real backstop. The cap in `server.py`
+  bounds the Sarvam bill, which is the half that costs actual money. Fine on
+  a laptop, wrong for anything reachable.
 - **Caller utterances and account numbers go to Google.** Fine for a portfolio
   project; a real deployment needs a DPA and probably in-region hosting.
 - **Erasure is SQL-level, not disk-level.** Measured with pageinspect: after
