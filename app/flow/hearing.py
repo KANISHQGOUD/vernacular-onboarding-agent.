@@ -84,6 +84,22 @@ CONFIDENCE_FLOOR: Mapping[State, float] = MappingProxyType(
 # has to be wrong about one of them.
 CODE_MIXED_FIELDS: frozenset[str] = frozenset({"full_name", "address", "occupation"})
 
+# Read back before being written down. Three, not five: the ones that are hard
+# to fix afterwards. The mobile receives the OTP, the date of birth drives the
+# age rule, and the name goes on the account -- an address or an occupation is
+# re-askable later by somebody at a branch.
+#
+# This is also the practical answer to Sarvam reporting no confidence. A
+# floor compares a number the provider does not give us; a read-back asks the
+# only party who actually knows.
+CONFIRMED_FIELDS: frozenset[str] = frozenset(
+    {"mobile", "date_of_birth", "full_name"}
+)
+
+
+def needs_confirming(field: str) -> bool:
+    return field in CONFIRMED_FIELDS
+
 
 def expectation_for(state: State, field: str | None = None) -> Expectation:
     """What kind of speech to tell the recogniser to expect.

@@ -190,6 +190,13 @@ class Conversation:
             # possibly work.
             return self._reply(session, moved=False, understood=False)
 
+        # A read-back being answered. Handled here rather than by the
+        # generic path because confirming is not a state change -- the value
+        # moving from pending to written is the whole event, and `fire` alone
+        # would leave it in limbo.
+        if reading.intent in (Event.FIELD_CONFIRMED, Event.FIELD_CORRECTED):
+            return self._answer_read_back(session, reading.intent)
+
         self._record_before_moving(session, reading)
 
         try:
@@ -203,6 +210,11 @@ class Conversation:
         rejected = self._record_after_moving(session, reading)
         if rejected is not None:
             return self._rejected_reply(session, rejected)
+
+        # A high-stakes field is waiting to be read back. Do not advance:
+        # nothing has been written down yet.
+        if session.pending_field is not None:
+            return self._read_back(session)
 
         self._advance(session)
         return self._reply(session, moved=session.state is not before, understood=True)
@@ -292,6 +304,57 @@ class Conversation:
                 return
 
     # -- Step 5: what the state says ----------------------------------------
+
+    def _read_back(self, session: Session) -> Reply:
+        """Say what we wrote down and ask whether it is right."""
+        return Reply(
+            text=self.phraser.say(
+                SpeechAct(
+                    kind=SpeechActKind.CONFIRM_FIELD,
+                    language=session.language or DEFAULT_LANGUAGE,
+                    data={
+                        "field_label": FIELD_LABELS.get(
+                            session.pending_field or "", "answer"
+                        ),
+                        "value": session.pending_value or "",
+                    },
+                )
+            ),
+            state=session.state,
+            moved=False,
+            understood=True,
+        )
+
+    def _answer_read_back(self, session: Session, intent: Event) -> Reply:
+        """Yes writes it down; no forgets it and asks again.
+
+        Both can arrive with nothing pending -- the intents are legal in
+        COLLECT_DATA on every turn, because `classifiable_events` is per
+        state. The guard in the map refuses that case, which surfaces here as
+        a FlowError and is answered as a misunderstanding. Which it was:
+        somebody answered a question nobody asked.
+        """
+        if session.pending_field is None:
+            # Answering a question nobody asked. The map allows it -- rows are
+            # total -- so the refusal is made here, where the reason is known.
+            log.info("%s with nothing pending in %s", intent, session.state)
+            return self._reply(session, moved=False, understood=False)
+
+        try:
+            # Fire first, then move the data: the machine decides whether a
+            # confirmation counts, and writing before it accepted the event
+            # would be writing on our own authority.
+            self.actions.machine.fire(session, intent)
+            if intent is Event.FIELD_CONFIRMED:
+                self.actions.confirm_pending_field(session)
+            else:
+                self.actions.reject_pending_field(session)
+        except FlowError:
+            log.info("refused %s in %s", intent, session.state)
+            return self._reply(session, moved=False, understood=False)
+
+        self._advance(session)
+        return self._reply(session, moved=True, understood=True)
 
     def _rejected_reply(self, session: Session, rejected: FieldRejected) -> Reply:
         """Ask again, saying what was wrong with the VALUE.

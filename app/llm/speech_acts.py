@@ -58,6 +58,7 @@ class SpeechActKind(StrEnum):
     ACKNOWLEDGE_STOPPED = "ACKNOWLEDGE_STOPPED"
     ADMIT_OUR_FAULT = "ADMIT_OUR_FAULT"
     FIELD_NOT_USABLE = "FIELD_NOT_USABLE"
+    CONFIRM_FIELD = "CONFIRM_FIELD"
     HANDING_TO_HUMAN = "HANDING_TO_HUMAN"
     DID_NOT_UNDERSTAND = "DID_NOT_UNDERSTAND"
 
@@ -161,6 +162,21 @@ SPEECH_ACTS: Mapping[SpeechActKind, SpeechActSpec] = MappingProxyType(
                     "that by speaking differently."
                 ),
                 fallback="Sorry, {problem_text}. Could you tell me your {field_label} again?",
+            ),
+            SpeechActSpec(
+                kind=SpeechActKind.CONFIRM_FIELD,
+                intent=(
+                    "Read the value back and ask whether it is right. Say the "
+                    "value exactly as given -- do not tidy it, re-spell it, "
+                    "expand it or translate it. One short question."
+                ),
+                # The entire point of the turn is that they hear what we wrote
+                # down. A model that helpfully corrects आशा to आशा देवी, or
+                # reads 9812345678 as "about ninety-eight crore", has replaced
+                # the thing being checked with its own guess -- and the caller
+                # would be confirming something they never said.
+                verbatim=("value",),
+                fallback="I have your {field_label} as {value}. Is that right?",
             ),
             SpeechActSpec(
                 kind=SpeechActKind.ANNOUNCE_DECLINE,

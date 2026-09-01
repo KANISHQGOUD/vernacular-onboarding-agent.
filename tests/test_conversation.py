@@ -66,13 +66,22 @@ def build(*readings, kyc_outcomes=None):
     return conversation, Session(session_id="conv"), audit
 
 
+# The turns a qualifying applicant actually takes. Note the confirmations:
+# `hearing.CONFIRMED_FIELDS` reads the mobile, the date of birth and the name
+# back before writing them down, so each of those costs two turns rather than
+# one. Address and occupation do not -- they are re-askable later, and five
+# read-backs is a real cost in a flow built for people who find forms long.
 FULL_JOURNEY = (
     Classification(Event.LANGUAGE_CHOSEN, language="hi-IN"),
     Classification(Event.CONSENT_GIVEN),
     Classification(Event.DATA_PROVIDED, "full_name", "Asha Devi"),
+    Classification(Event.FIELD_CONFIRMED),
     Classification(Event.DATA_PROVIDED, "date_of_birth", "1990-01-01"),
-    Classification(Event.DATA_PROVIDED, "address", "14 Gandhi Road"),
+    Classification(Event.FIELD_CONFIRMED),
+    Classification(Event.DATA_PROVIDED, "address", "14 Gandhi Marg, Jaipur"),
     Classification(Event.DATA_PROVIDED, "occupation", "tailor"),
+    # No mobile turn: `check_eligibility` writes it from the pre-screen answer
+    # before COLLECT_DATA is reached, so it is never asked for here.
 )
 
 
@@ -174,15 +183,23 @@ def test_the_last_field_does_not_double_fire():
 
 
 def test_data_collection_asks_for_the_next_missing_field():
-    conversation, session, _ = build(*FULL_JOURNEY[:3])
+    conversation, session, _ = build(*FULL_JOURNEY[:4])
     conversation.open(session)
     conversation.respond(session, "hindi")
     conversation.respond(session, "haan")
 
     assert session.state is State.COLLECT_DATA
-    reply = conversation.respond(session, "mera naam Asha Devi hai")
 
-    # full_name is now stored, so the next question is the next missing field.
+    # The name is read back before it is written down -- it is one of
+    # hearing.CONFIRMED_FIELDS -- so the next question comes one turn later
+    # than it used to.
+    read_back = conversation.respond(session, "mera naam Asha Devi hai")
+    assert session.pending_field == "full_name"
+    assert "Asha Devi" in read_back.text
+    assert "full_name" not in session.applicant, "written down before confirming"
+
+    reply = conversation.respond(session, "haan sahi hai")
+
     assert "Asha Devi" == session.applicant["full_name"]
     assert FIELD_LABELS["date_of_birth"] in reply.text
 
@@ -523,6 +540,7 @@ def test_an_impossible_value_is_re_asked_without_blaming_them():
     conversation, session, _ = build(
         Classification(Event.DATA_PROVIDED, "mobile", "98123"),
         Classification(Event.DATA_PROVIDED, "mobile", "9812345678"),
+        Classification(Event.FIELD_CONFIRMED),
     )
     conversation.as_of = date(2026, 9, 2)
     session.state = State.COLLECT_DATA
@@ -536,6 +554,14 @@ def test_an_impossible_value_is_re_asked_without_blaming_them():
     for blame in ("clearly", "slowly", "didn't catch", "did not catch"):
         assert blame not in rejected.text.lower()
 
-    # And saying it properly still works -- the refusal is not a dead end.
-    conversation.respond(session, "nine eight one two three four five six seven eight")
+    # Saying it properly still works -- the refusal is not a dead end. The
+    # mobile is a confirmed field, so it is read back rather than written
+    # straight down.
+    read_back = conversation.respond(
+        session, "nine eight one two three four five six seven eight"
+    )
+    assert session.pending_field == "mobile"
+    assert "9812345678" in read_back.text, "the value must be read back verbatim"
+
+    conversation.respond(session, "yes that is right")
     assert session.applicant["mobile"] == "9812345678"

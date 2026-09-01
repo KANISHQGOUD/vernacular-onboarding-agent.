@@ -28,7 +28,7 @@ from app.providers.core_banking import MockCoreBanking
 from app.providers.kyc import MockKycProvider
 from app.providers.payments import MockPaymentRail
 from app.session import REQUIRED_APPLICANT_FIELDS, Session
-from tests.conftest import AS_OF
+from tests.conftest import AS_OF, save_field
 
 # ---------------------------------------------------------------------------
 # Normalisation the rules depend on.
@@ -167,8 +167,12 @@ def test_the_applicant_gets_the_last_word():
         with pytest.raises(FieldRejected):
             actions.save_applicant_field(session, "mobile", "12345", as_of=AS_OF)
 
-    # The last attempt is accepted.
+    # The last attempt is accepted -- and still read back, because a value
+    # we could not validate is the one most worth confirming with the only
+    # party who knows.
     actions.save_applicant_field(session, "mobile", "12345", as_of=AS_OF)
+    assert session.pending_field == "mobile"
+    actions.confirm_pending_field(session)
 
     assert session.applicant["mobile"] == "12345"
     assert session.notes["unvalidated:mobile"]
@@ -204,7 +208,7 @@ def test_attempts_are_counted_per_field():
 
 def test_a_good_value_never_counts_against_them():
     actions, session, _ = rig()
-    actions.save_applicant_field(session, "mobile", "9812345678", as_of=AS_OF)
+    save_field(actions, session, "mobile", "9812345678")
 
     assert session.applicant["mobile"] == "9812345678"
     assert session.field_attempts("mobile") == 0
@@ -220,6 +224,82 @@ def test_the_last_field_still_completes_the_set():
 
     data = complete_applicant_data()
     for name, value in data.items():
-        actions.save_applicant_field(session, name, value, as_of=AS_OF)
+        save_field(actions, session, name, value)
 
     assert session.state is State.KYC_HANDOFF
+
+
+# ---------------------------------------------------------------------------
+# Read-back. The confidence the provider does not report, asked for instead.
+# ---------------------------------------------------------------------------
+
+
+def test_a_high_stakes_field_is_not_written_down_until_it_is_agreed():
+    """Staged, not stored. A "no" should never have to un-write anything."""
+    actions, session, _ = rig()
+
+    actions.save_applicant_field(session, "full_name", "Asha Devi", as_of=AS_OF)
+
+    assert session.pending_field == "full_name"
+    assert session.pending_value == "Asha Devi"
+    assert "full_name" not in session.applicant
+
+
+def test_a_lower_stakes_field_is_written_straight_down():
+    """Five read-backs is a real cost in a flow built for people who already
+    find forms long. An address is re-askable; a name on an account is not."""
+    actions, session, _ = rig()
+
+    actions.save_applicant_field(session, "address", "14 Gandhi Marg, Jaipur", as_of=AS_OF)
+
+    assert session.pending_field is None
+    assert session.applicant["address"] == "14 Gandhi Marg, Jaipur"
+
+
+def test_saying_no_discards_it_rather_than_offering_it_back():
+    """A value they have already denied is not a starting point for a guess.
+    Keeping it as a suggestion would be arguing with them."""
+    actions, session, _ = rig()
+    actions.save_applicant_field(session, "full_name", "Asha Devri", as_of=AS_OF)
+
+    actions.reject_pending_field(session)
+
+    assert session.pending_field is None
+    assert session.pending_value is None
+    assert "full_name" not in session.applicant
+    assert session.corrections("full_name") == 1
+
+
+def test_confirming_the_last_field_still_completes_the_set():
+    """The completion check lives on the commit path, so it must fire whether
+    the value arrived confirmed or not -- otherwise a session whose final
+    field needed a read-back sits in COLLECT_DATA forever."""
+    actions, session, _ = rig()
+    from tests.conftest import complete_applicant_data
+
+    data = complete_applicant_data()
+    for name in ("address", "occupation", "mobile", "date_of_birth"):
+        save_field(actions, session, name, data[name])
+
+    assert session.state is State.COLLECT_DATA
+
+    actions.save_applicant_field(session, "full_name", data["full_name"], as_of=AS_OF)
+    assert session.state is State.COLLECT_DATA, "completed before it was agreed"
+
+    actions.confirm_pending_field(session)
+    assert session.state is State.KYC_HANDOFF
+
+
+def test_corrections_survive_erasure_but_the_value_does_not():
+    """How often a read-back was denied is operational; what was read back is
+    the person. They are stored on opposite sides of that line."""
+    actions, session, _ = rig()
+    actions.save_applicant_field(session, "full_name", "Asha Devri", as_of=AS_OF)
+    actions.reject_pending_field(session)
+    actions.save_applicant_field(session, "full_name", "Asha Devi", as_of=AS_OF)
+
+    session.erase_personal_data()
+
+    assert session.pending_field is None
+    assert session.pending_value is None
+    assert session.corrections("full_name") == 1

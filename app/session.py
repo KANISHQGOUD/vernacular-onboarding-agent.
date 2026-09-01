@@ -59,6 +59,16 @@ class Session:
     # append-only log coexist with a deletion request.
     heard: dict[str, str] = field(default_factory=dict)
 
+    # A value read back and awaiting a yes or no. Held here rather than
+    # written to `applicant`, because a field that has not been confirmed is
+    # not yet an answer -- and writing it early would mean a "no" had to
+    # un-write it, which is a worse shape than never having written it.
+    #
+    # `pending_value` is personal data like the rest; `pending_field` is just
+    # a field name, but it goes with it.
+    pending_field: str | None = None
+    pending_value: str | None = None
+
     # Both halves of the screening are kept: the answers that went in, and the
     # verdict that came out. eligibility.py promises a decision can be replayed
     # from its stored input years later -- that promise is only real if the
@@ -81,6 +91,17 @@ class Session:
     @property
     def eligibility_passed(self) -> bool:
         return self.eligibility is not None and self.eligibility.passed
+
+    def corrections(self, field_name: str) -> int:
+        """How many times a read-back of this field has been denied.
+
+        Operational, like `field_attempts` -- it describes how badly the
+        conversation went, not who the person is -- so it survives erasure.
+        """
+        try:
+            return int(self.notes.get(f"corrections:{field_name}", "0"))
+        except ValueError:
+            return 0
 
     def field_attempts(self, field_name: str) -> int:
         """How many times this field has been rejected already.
@@ -136,6 +157,8 @@ class Session:
         """
         self.applicant.clear()
         self.heard.clear()
+        self.pending_field = None
+        self.pending_value = None
         self.eligibility_input = None
 
     # -- Persistence --------------------------------------------------------
@@ -148,6 +171,8 @@ class Session:
             "consent_recorded": self.consent_recorded,
             "applicant": dict(self.applicant),
             "heard": dict(self.heard),
+            "pending_field": self.pending_field,
+            "pending_value": self.pending_value,
             "notes": dict(self.notes),
             "eligibility_input": (
                 self.eligibility_input.to_dict() if self.eligibility_input else None
@@ -169,6 +194,8 @@ class Session:
             consent_recorded=raw["consent_recorded"],
             applicant=dict(raw["applicant"]),
             heard=dict(raw.get("heard", {})),
+            pending_field=raw.get("pending_field"),
+            pending_value=raw.get("pending_value"),
             notes=dict(raw.get("notes", {})),
             eligibility_input=(
                 EligibilityInput.from_dict(raw["eligibility_input"])

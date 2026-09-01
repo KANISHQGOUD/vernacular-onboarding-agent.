@@ -79,3 +79,17 @@ def complete_applicant_data() -> dict[str, str]:
         "occupation": "tailor",
         "mobile": "9812345678",
     }
+
+
+def save_field(actions, session, field_name: str, value: str, *, as_of=AS_OF):
+    """Save a field the way a whole conversation would.
+
+    `hearing.CONFIRMED_FIELDS` reads some values back before writing them, so
+    a caller driving the flow by hand has to answer the read-back too.
+    Without this, a test that saves five fields ends up with three of them
+    still pending and a session that never leaves COLLECT_DATA.
+    """
+    actions.save_applicant_field(session, field_name, value, as_of=as_of)
+    if session.pending_field is not None:
+        actions.confirm_pending_field(session)
+    return session

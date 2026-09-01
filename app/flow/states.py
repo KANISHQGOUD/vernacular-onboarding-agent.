@@ -120,6 +120,11 @@ class Event(StrEnum):
     CONSENT_REFUSED = "CONSENT_REFUSED"
     DATA_PROVIDED = "DATA_PROVIDED"
     USER_WANTS_HUMAN = "USER_WANTS_HUMAN"
+    # Answers to "I have written down X -- is that right?". Intents, because
+    # they are readings of what the caller meant; a model may emit them, and
+    # nothing about the world changes until one is acted on.
+    FIELD_CONFIRMED = "FIELD_CONFIRMED"
+    FIELD_CORRECTED = "FIELD_CORRECTED"
     USER_QUIT = "USER_QUIT"
 
     # -- Facts: produced by our own code or a tool result, never by the LLM --
@@ -251,6 +256,37 @@ TRANSITIONS: dict[tuple[State, Event], tuple[Transition, ...]] = {
     # -- COLLECT_DATA --------------------------------------------------------
     (State.COLLECT_DATA, Event.DATA_PROVIDED): (
         Transition(State.COLLECT_DATA, why="One field captured; stay here for the rest."),
+    ),
+    # Reading a value back and being told yes or no. Both stay in
+    # COLLECT_DATA: confirming is not progress through the flow, it is the
+    # same step finishing properly.
+    #
+    # Guarded on there being something pending, then an unconditional
+    # fallback -- because every row here must be total. That rule exists to
+    # keep `NoGuardMatchedError` structurally unreachable, and a first draft
+    # of this pair leaned on that exception to reject a stray confirmation.
+    # Wrong way round: a session must never be stranded by a guard, so the
+    # map always answers and the conversation decides what it meant.
+    #
+    # These events are legal here on every turn, because `classifiable_events`
+    # is per state and cannot see whether a value is waiting. So "yes" with
+    # nothing pending is a real possibility, and it lands on the fallback,
+    # which changes nothing.
+    (State.COLLECT_DATA, Event.FIELD_CONFIRMED): (
+        Transition(
+            State.COLLECT_DATA,
+            guard=lambda s: s.pending_field is not None,
+            why="Read back and agreed; the value can be written down.",
+        ),
+        Transition(State.COLLECT_DATA, why="Nothing was waiting to be confirmed."),
+    ),
+    (State.COLLECT_DATA, Event.FIELD_CORRECTED): (
+        Transition(
+            State.COLLECT_DATA,
+            guard=lambda s: s.pending_field is not None,
+            why="Read back and denied; ask for it again.",
+        ),
+        Transition(State.COLLECT_DATA, why="Nothing was waiting to be corrected."),
     ),
     (State.COLLECT_DATA, Event.REQUIRED_DATA_COMPLETE): (
         Transition(State.KYC_HANDOFF, why="Everything the KYC provider needs is on file."),

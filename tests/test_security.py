@@ -33,7 +33,7 @@ from app.providers.core_banking import MockCoreBanking
 from app.providers.kyc import MockKycProvider
 from app.providers.payments import MockPaymentRail
 from app.session import Session
-from tests.conftest import AS_OF
+from tests.conftest import AS_OF, save_field
 from tests.test_llm import FakeClient
 
 # Things a caller might say to try to talk their way past the machine. Written
@@ -194,7 +194,7 @@ def _drive_full_journey(actions: Actions, session: Session) -> Session:
         as_of=AS_OF,
     )
     for name in sorted(session.missing_fields):
-        actions.save_applicant_field(session, name, PERSONAL_VALUES[name], as_of=AS_OF)
+        save_field(actions, session, name, PERSONAL_VALUES[name])
     actions.start_video_kyc(session)
     actions.check_kyc_status(session)
     actions.open_account(session)

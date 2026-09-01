@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from app.flow.eligibility import EligibilityInput, Residency, evaluate
+from app.flow.hearing import needs_confirming
 from app.flow.fields import (
     MAX_FIELD_ATTEMPTS,
     FieldProblem,
@@ -165,10 +166,66 @@ class Actions:
                 detail=f"{field_name} stored after {attempts} attempts: {problem}",
             )
 
-        session.applicant[field_name] = normalised(field_name, value)
+        clean = normalised(field_name, value)
+
+        # High-stakes fields are read back before they are written down. See
+        # hearing.CONFIRMED_FIELDS: the provider reports no confidence, so the
+        # only party who actually knows whether we heard it right is asked.
+        if needs_confirming(field_name):
+            session.pending_field = field_name
+            session.pending_value = clean
+            return session
+
+        return self._commit_field(session, field_name, clean)
+
+    def _commit_field(self, session: Session, field_name: str, value: str) -> Session:
+        """Write it down, and fire completion if that was the last one.
+
+        Shared by the confirmed and unconfirmed paths, because "was that the
+        final field" must be answered the same way regardless of how the value
+        arrived -- and a session that hit the budget on its last field would
+        otherwise sit in COLLECT_DATA forever.
+        """
+        session.applicant[field_name] = value
 
         if session.required_data_complete:
             return self.machine.fire(session, Event.REQUIRED_DATA_COMPLETE)
+        return session
+
+    def confirm_pending_field(self, session: Session) -> Session:
+        """They said yes. Write it down.
+
+        Does NOT fire FIELD_CONFIRMED, and that is the rule this file lives
+        by: what a caller meant is an intent, and moving the machine on an
+        intent belongs to the layer that read it, not to the provider layer.
+        `record_consent` and `save_applicant_field` are the same shape, and a
+        test parses this module to keep it that way.
+        """
+        field_name = session.pending_field
+        value = session.pending_value
+        session.pending_field = None
+        session.pending_value = None
+
+        if field_name is None or value is None:
+            return session
+        return self._commit_field(session, field_name, value)
+
+    def reject_pending_field(self, session: Session) -> Session:
+        """They said no. Forget it and count the miss.
+
+        Fires nothing, for the reason above. The value is discarded rather
+        than kept as a suggestion: a read-back they have already denied is not
+        a starting point for a guess -- it is the wrong answer, and offering
+        it back would be arguing with them.
+        """
+        field_name = session.pending_field
+        session.pending_field = None
+        session.pending_value = None
+
+        if field_name is not None:
+            session.notes[f"corrections:{field_name}"] = str(
+                session.corrections(field_name) + 1
+            )
         return session
 
     def record_lapse(self, session: Session) -> Session:
@@ -271,7 +328,12 @@ class Actions:
         # is unanswerable once the ruleset moves on.
         session.eligibility_input = applicant
         session.eligibility = evaluate(applicant)
-        session.applicant["mobile"] = mobile
+        # Normalised, because this is a second door into `applicant` that
+        # does not go through `save_applicant_field` -- so it gets neither
+        # validation nor a read-back. Defensible for a pre-screen answer,
+        # which was given before the conversation reached COLLECT_DATA and is
+        # therefore never asked for again; worth knowing about all the same.
+        session.applicant["mobile"] = normalised("mobile", mobile)
 
         return self.machine.fire(session, Event.ELIGIBILITY_CHECKED)
 

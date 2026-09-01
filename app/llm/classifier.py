@@ -91,6 +91,14 @@ INTENT_GLOSS: dict[Event, str] = {
         "They want to stop or leave -- not now, later, cancel, forget it, "
         "goodbye."
     ),
+    Event.FIELD_CONFIRMED: (
+        "A value was read back to them and they agreed it is right -- yes, "
+        "correct, that's it, right."
+    ),
+    Event.FIELD_CORRECTED: (
+        "A value was read back to them and they said it is wrong, or "
+        "immediately gave a different one instead."
+    ),
 }
 
 FIELD_GLOSS: dict[str, str] = {

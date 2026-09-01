@@ -42,6 +42,8 @@ USER_INTENT_EVENTS: frozenset[Event] = frozenset(
         Event.DATA_PROVIDED,
         Event.USER_WANTS_HUMAN,
         Event.USER_QUIT,
+        Event.FIELD_CONFIRMED,
+        Event.FIELD_CORRECTED,
     }
 )
 
