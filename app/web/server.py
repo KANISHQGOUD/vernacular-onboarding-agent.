@@ -37,6 +37,19 @@ Utterances are bounded and non-empty. The text goes into a model prompt, and
 an unbounded field reaching a prompt is both a cost problem and an injection
 surface. The fence in classifier.py handles the second; this handles the
 first, before the call is billed rather than after.
+
+`audio` is bounded by the same argument and needs it more, because it is
+billed per second against a prepaid balance rather than per token. Both caps,
+and the terminal-state check, run *before* anything is sent to a vendor: the
+order of the checks in the loop is load-bearing, not incidental.
+
+WHAT THE SOCKET DOES NOT WRITE DOWN
+-----------------------------------
+Transcripts never reach a log line. A caller in COLLECT_DATA is saying their
+name, address and date of birth, and application logs are outside both
+`erase_personal_data()` and the deliberately PII-free audit trail -- so a
+debug line echoing the transcript would put regulated data in the one place
+this project has no story for erasing. Byte counts and lengths, never text.
 """
 
 from __future__ import annotations
@@ -57,7 +70,11 @@ from app.flow.actions import Actions
 from app.flow.machine import Machine
 from app.flow.fields import next_field
 from app.flow.hearing import expectation_for, is_confident_enough
-from app.flow.turn_taking import interruption_matters, policy_for
+from app.flow.turn_taking import (
+    DEFAULT_PATIENCE_MS,
+    interruption_matters,
+    policy_for,
+)
 from app.flow.states import TERMINAL_STATES, State
 from app.llm.classifier import GeminiIntentClassifier, OfflineClassifier
 from app.llm.client import LlmClient, api_key_available
@@ -79,6 +96,21 @@ log = logging.getLogger(__name__)
 # Longer than any real spoken turn, short enough that it cannot be used to
 # inflate a prompt. A caller who needs more than this is not talking.
 MAX_UTTERANCE_LENGTH = 500
+
+# The same bound for audio, derived rather than guessed. The page records for
+# at most DEFAULT_PATIENCE_MS before its hard stop, and Opus in a WebM
+# container tops out around 128 kbps in a browser -- so the longest turn our
+# own front end can produce is about 192 KB. The doubling is headroom for a
+# browser that encodes fatter than Chrome does.
+#
+# Deliberately loose. This is a ceiling on abuse, not a fit to real speech: a
+# cap tuned to the exact bitrate would start refusing honest callers on some
+# browser nobody tested, which is the failure this product can least afford.
+MAX_AUDIO_BYTES = 2 * (DEFAULT_PATIENCE_MS // 1000) * 128_000 // 8
+
+# Checked against the field as it arrives. Base64 is four characters per three
+# bytes, and decoding first would mean allocating the thing being refused.
+MAX_AUDIO_BASE64 = MAX_AUDIO_BYTES * 4 // 3 + 4
 
 # 1008 is "policy violation" -- the right answer to a socket that failed
 # authorisation, and deliberately the same answer for every reason it failed.
@@ -316,6 +348,15 @@ def create_app(
         try:
             while True:
                 message = await socket.receive_json()
+
+                # First, because everything below it spends money. A finished
+                # session has nothing to say, and a client replaying its last
+                # turn into one would otherwise pay a vendor to transcribe
+                # audio we then throw away with "session is finished".
+                if loaded.state in TERMINAL_STATES:
+                    await socket.send_json({"error": "session is finished"})
+                    continue
+
                 utterance = (message or {}).get("utterance", "")
 
                 # Audio instead of a transcript, when the page could not get
@@ -323,6 +364,15 @@ def create_app(
                 # a machine whose Chrome cannot reach Google's speech service
                 # is still able to hold a conversation.
                 clip = (message or {}).get("audio")
+
+                if clip is not None and not isinstance(clip, str):
+                    await socket.send_json({"error": "audio not usable"})
+                    continue
+
+                if clip and len(clip) > MAX_AUDIO_BASE64:
+                    await socket.send_json({"error": "audio too long"})
+                    continue
+
                 if clip and speech is not None and not utterance.strip():
                     try:
                         heard = speech.transcribe(
@@ -341,7 +391,14 @@ def create_app(
                             ),
                         )
                         utterance = heard.text
-                        log.info("transcribed %s bytes -> %r", len(clip), utterance)
+                        # Sizes, not words. See the module docstring: this is
+                        # a name or an address, and a log file is the one
+                        # store erase_personal_data() cannot reach.
+                        log.info(
+                            "transcribed %s bytes -> %s chars",
+                            len(clip),
+                            len(utterance),
+                        )
                     except Exception:  # noqa: BLE001 - a vendor failing is not fatal
                         log.warning("server-side transcription failed", exc_info=True)
                         await socket.send_json(
@@ -355,10 +412,6 @@ def create_app(
 
                 if len(utterance) > MAX_UTTERANCE_LENGTH:
                     await socket.send_json({"error": "utterance too long"})
-                    continue
-
-                if loaded.state in TERMINAL_STATES:
-                    await socket.send_json({"error": "session is finished"})
                     continue
 
                 # How sure the recogniser was, when there was one. Typed input

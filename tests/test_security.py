@@ -281,6 +281,44 @@ def test_a_failed_call_does_not_log_the_key_or_the_utterance(caplog):
     assert "14 Gandhi" not in logged
 
 
+def test_a_transcript_never_reaches_a_log_line(caplog):
+    """The same rule as the test above, on the one path that carries audio.
+
+    Server-side transcription is the only place where the caller's words are
+    produced *inside* this process rather than arriving as text, which made it
+    the natural place to add a debug line while chasing a microphone bug. It
+    is also the worst place: somebody in COLLECT_DATA is saying their name and
+    their address, and a log file is the one store `erase_personal_data()`
+    cannot reach and the audit trail deliberately is not.
+    """
+    import base64
+
+    from app.speech import MockSpeech, Transcript
+    from tests.test_web import build_client, open_session, socket_url
+
+    said = "मेरा नाम आशा देवी है, 14 Gandhi Road, Nashik"
+    speech = MockSpeech(
+        hears=[
+            Transcript(text=said, language="hi-IN", confidence=0.99, provider="mock")
+        ]
+    )
+
+    caplog.set_level(logging.DEBUG)
+    client, _ = build_client(speech=speech)
+    created = open_session(client)
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        socket.receive_json()
+        socket.send_json({"audio": base64.b64encode(b"pretend this is opus").decode()})
+        socket.receive_json()
+
+    assert speech.expected, "the transcription path never ran"
+
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "आशा देवी" not in logged
+    assert "Gandhi Road" not in logged
+
+
 def test_phrasing_failures_do_not_log_the_rendered_sentence(caplog):
     """A discarded translation may still contain the account number."""
     caplog.set_level(logging.DEBUG)

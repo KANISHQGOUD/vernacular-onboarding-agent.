@@ -22,7 +22,7 @@ from app.providers.core_banking import MockCoreBanking
 from app.providers.kyc import KycStatus, MockKycProvider
 from app.providers.payments import MockPaymentRail
 from app.web.registry import SessionRegistry
-from app.web.server import MAX_UTTERANCE_LENGTH, create_app
+from app.web.server import MAX_AUDIO_BYTES, MAX_UTTERANCE_LENGTH, create_app
 from tests.conftest import AS_OF
 from tests.test_conversation import FULL_JOURNEY, Classification, FakeReader
 
@@ -612,3 +612,69 @@ def test_an_interruption_elsewhere_is_not_noise_in_the_trail():
 
     kinds = [r.kind for r in audit.for_session(created["session_id"])]
     assert AuditKind.CALLER_INTERRUPTED not in kinds
+
+
+# ---------------------------------------------------------------------------
+# What the socket refuses before it spends money. Ordering, not just outcome.
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_audio_is_refused_before_it_is_decoded():
+    """The text cap protects a prompt; this protects a prepaid balance.
+
+    Sarvam bills per second of audio, so an unbounded `audio` field is a way
+    to spend somebody else's credit -- and decoding it before checking would
+    mean allocating the very thing being refused.
+    """
+    import base64
+
+    from app.speech import MockSpeech
+
+    speech = MockSpeech()
+    client, _ = build_client(speech=speech)
+    created = open_session(client)
+
+    # Valid base64 of a real over-sized clip, not a long string of junk.
+    # Junk would be refused by `b64decode` raising even with no cap at all,
+    # and the test would then pass against the bug it exists to catch.
+    oversized = base64.b64encode(b"\0" * (MAX_AUDIO_BYTES + 1024)).decode()
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        socket.receive_json()
+        socket.send_json({"audio": oversized})
+        assert "error" in socket.receive_json()
+
+        # And a clip inside the cap still goes through, or the test above
+        # would pass on a server that had simply stopped accepting audio.
+        socket.send_json({"audio": base64.b64encode(b"a real turn").decode()})
+        socket.receive_json()
+
+    assert len(speech.expected) == 1, "the oversized clip reached the recogniser"
+
+
+def test_a_finished_session_is_refused_before_anything_is_billed():
+    """A reconnecting page replaying its last turn into a completed session.
+
+    This used to be transcribed first and rejected second: a vendor was paid
+    to produce a sentence that was then thrown away with "session is
+    finished". The check is cheap and belongs above the one that costs money.
+    """
+    import base64
+
+    from app.speech import MockSpeech
+
+    speech = MockSpeech()
+    client, _ = build_client(*FULL_JOURNEY, speech=speech)
+    created = open_session(client)
+
+    with client.websocket_connect(socket_url(created)) as socket:
+        socket.receive_json()
+        for _ in FULL_JOURNEY:
+            socket.send_json({"utterance": "x"})
+            socket.receive_json()
+
+        billed_so_far = len(speech.expected)
+        socket.send_json({"audio": base64.b64encode(b"one more turn").decode()})
+        assert "error" in socket.receive_json()
+
+    assert len(speech.expected) == billed_so_far, "a finished session was billed"
