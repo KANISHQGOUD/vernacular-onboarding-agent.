@@ -41,6 +41,7 @@ from typing import Callable, Mapping
 
 from app.audit import AuditKind
 from app.flow.actions import ActionRefused, Actions, FieldRejected
+from app.flow.fields import FIELD_ORDER, next_field
 from app.flow.eligibility import DeclineReason, Residency
 from app.flow.intents import UntrustedEventError
 from app.flow.machine import FlowError
@@ -56,15 +57,7 @@ from app.session import Session
 log = logging.getLogger(__name__)
 
 # What the agent asks for, in the order it asks. A list rather than the
-# frozenset so the questions arrive in a sensible order instead of whatever
-# order the set happens to iterate in.
-FIELD_ORDER: tuple[str, ...] = (
-    "full_name",
-    "date_of_birth",
-    "address",
-    "occupation",
-    "mobile",
-)
+# FIELD_ORDER now lives in app/flow/fields.py, beside the rules that use it.
 
 FIELD_LABELS: Mapping[str, str] = {
     "full_name": "full name",
@@ -372,10 +365,7 @@ class Conversation:
     @staticmethod
     def _data_for(session: Session, kind: SpeechActKind) -> dict[str, str]:
         if kind is SpeechActKind.ASK_FIELD:
-            missing = next(
-                (f for f in FIELD_ORDER if f in session.missing_fields),
-                None,
-            )
+            missing = next_field(session.missing_fields)
             return {"field_label": FIELD_LABELS.get(missing, "details")} if missing else {}
 
         if kind is SpeechActKind.ANNOUNCE_DECLINE:

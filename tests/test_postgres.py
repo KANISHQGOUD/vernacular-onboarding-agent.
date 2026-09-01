@@ -503,6 +503,8 @@ def test_erasure_removes_the_person_from_the_database(store, schema):
     session.language = "hi-IN"
     session.consent_recorded = True
     session.applicant = _applicant_with_everything()
+    # Raw transcripts of the same personal data, which must go with it.
+    session.heard = dict(_applicant_with_everything())
     session.notes = {"last_kyc_failure": "NETWORK_DROPPED", "attempts": "2"}
     session.eligibility_input = eligible_applicant()
     session.eligibility = evaluate(session.eligibility_input)
@@ -524,6 +526,7 @@ def test_erasure_removes_the_person_from_the_database(store, schema):
     loaded = store.load(session.session_id)
     assert loaded is not None, "erasure deleted the session, not just the person"
     assert loaded.applicant == {}
+    assert loaded.heard == {}, "the raw transcripts survived erasure"
     assert loaded.eligibility_input is None, "date of birth and residency survived"
 
     # What the bank must still be able to answer afterwards.

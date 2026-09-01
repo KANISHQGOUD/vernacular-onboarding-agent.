@@ -138,6 +138,11 @@ class Actions:
         """
         self.machine.assert_tool_allowed(session, ToolName.SAVE_APPLICANT_FIELD)
 
+        # Recorded before validating, and kept even when the value is
+        # refused: "what did the machine hear on the attempt that failed" is
+        # exactly the question worth being able to answer later.
+        session.heard[field_name] = value
+
         problem = validate(field_name, value, as_of=as_of)
         if problem is not None:
             attempts = session.field_attempts(field_name) + 1

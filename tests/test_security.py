@@ -433,3 +433,52 @@ def test_a_healthy_sink_still_moves_the_session():
 
     assert session.state is not State.START
     assert AuditKind.TRANSITION_ACCEPTED in machine._audit.written
+
+
+def test_what_was_heard_is_erased_with_the_person():
+    """`heard` holds raw transcripts of somebody's name and address. It is
+    personal data by any reading, so it goes when they ask to be forgotten --
+    and it must never have reached the audit trail, which cannot forget."""
+    from app.flow.states import State
+
+    session = Session(session_id="heard-erase", state=State.COLLECT_DATA)
+    session.heard = {"full_name": "आशा देवी राठौड़", "mobile": "9812345678"}
+    session.applicant = {"full_name": "आशा देवी राठौड़"}
+    session.notes["attempts:mobile"] = "2"
+
+    session.erase_personal_data()
+
+    assert session.heard == {}
+    assert session.applicant == {}
+    # Operational metadata survives: how often a rule fired is answerable
+    # after the person is gone, which is the whole point of the split.
+    assert session.notes["attempts:mobile"] == "2"
+
+
+def test_what_was_heard_survives_a_round_trip_before_erasure():
+    """It is only useful if it is actually stored."""
+    from app.flow.states import State
+
+    session = Session(session_id="heard-store", state=State.COLLECT_DATA)
+    session.heard = {"mobile": "98123"}
+
+    restored = Session.from_dict(session.to_dict())
+    assert restored.heard == {"mobile": "98123"}
+
+
+def test_a_rejected_value_is_still_remembered_as_heard(rig):
+    """The failed attempt is the interesting one: "what did the machine hear
+    when it refused me" is unanswerable without this."""
+    from datetime import date
+
+    from app.flow.actions import FieldRejected
+    from app.flow.states import State
+
+    actions, _ = rig
+    session = Session(session_id="heard-reject", state=State.COLLECT_DATA)
+
+    with pytest.raises(FieldRejected):
+        actions.save_applicant_field(session, "mobile", "98123", as_of=date(2026, 9, 2))
+
+    assert session.heard["mobile"] == "98123"
+    assert "mobile" not in session.applicant

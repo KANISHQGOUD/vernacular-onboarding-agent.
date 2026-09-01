@@ -173,6 +173,27 @@ RULES: tuple[FieldRule, ...] = (
 
 _BY_FIELD = {rule.field: rule for rule in RULES}
 
+# The order they are asked in. Easiest first: a name is one word and builds
+# some confidence that the machine can hear you at all, before a ten-digit
+# number that is the hardest thing in the flow to get right by voice.
+FIELD_ORDER: tuple[str, ...] = (
+    "full_name",
+    "date_of_birth",
+    "address",
+    "occupation",
+    "mobile",
+)
+
+
+def next_field(missing: frozenset[str] | set[str]) -> str | None:
+    """Which field is being asked for now.
+
+    Two callers need this -- the phrasing layer, to name the field, and the
+    speech layer, to know what kind of answer to expect -- and they must
+    agree. Scanning FIELD_ORDER in two places is how they stop agreeing.
+    """
+    return next((f for f in FIELD_ORDER if f in missing), None)
+
 
 def validate(field: str, value: str, *, as_of: date) -> FieldProblem | None:
     """The problem with this value, or None if there is none.

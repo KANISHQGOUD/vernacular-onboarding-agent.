@@ -505,17 +505,40 @@ def test_recorded_browser_audio_reaches_the_vendor_with_a_type_it_accepts():
 # ---------------------------------------------------------------------------
 
 
-def test_collecting_a_name_expects_english_inside_the_sentence():
-    """People say their own name, their street, their job in English while
-    speaking Hindi. "मेरा नाम Steve है" is ordinary, not exotic."""
+def test_a_name_expects_english_inside_it_but_a_date_does_not():
+    """It depends on the FIELD, not the state, and one setting for the whole
+    of COLLECT_DATA has to be wrong about one of them.
+
+    People say their own name, their street, their job in English while
+    speaking Hindi -- "मेरा नाम Steve है" is ordinary, not exotic. But the
+    default mode's normalisation is what turns spoken words into `1 जनवरी
+    1990` and `₹500`, which is exactly what the extractor downstream wants.
+    """
     from app.flow.hearing import expectation_for
 
-    assert expectation_for(State.COLLECT_DATA) is Expectation.CODE_MIXED
+    for field in ("full_name", "address", "occupation"):
+        assert expectation_for(State.COLLECT_DATA, field) is Expectation.CODE_MIXED, field
 
-    # Everywhere else the vendor's normalisation is wanted: a spoken amount
-    # arriving as Rs 500 is easier to extract from, not harder.
+    for field in ("date_of_birth", "mobile"):
+        assert expectation_for(State.COLLECT_DATA, field) is Expectation.PLAIN, field
+
+    # Nothing specific being asked for yet.
+    assert expectation_for(State.COLLECT_DATA) is Expectation.PLAIN
+
+    # Everywhere else the vendor's normalisation is wanted.
     for state in (State.CONSENT, State.LANGUAGE_SELECT, State.FUNDING):
         assert expectation_for(state) is Expectation.PLAIN
+
+
+def test_the_two_callers_agree_on_which_field_is_next():
+    """The phrasing layer names the field; the speech layer decides what to
+    expect of it. They scanned FIELD_ORDER separately, which is how two
+    things stop agreeing."""
+    from app.flow.fields import next_field
+
+    assert next_field({"mobile", "full_name"}) == "full_name"
+    assert next_field({"mobile"}) == "mobile"
+    assert next_field(set()) is None
 
 
 def test_the_expectation_reaches_the_vendor_as_its_own_setting():

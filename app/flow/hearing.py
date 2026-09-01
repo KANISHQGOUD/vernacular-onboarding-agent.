@@ -40,6 +40,7 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import Mapping
 
+from app.flow.fields import next_field
 from app.flow.states import State
 from app.speech.provider import Expectation
 
@@ -75,10 +76,16 @@ CONFIDENCE_FLOOR: Mapping[State, float] = MappingProxyType(
 # Measured on this project's corpus: code-mix mode kept `account` as
 # `account`, and spelled आशा देवी राठौड़ correctly where the default produced
 # राठौर. Better on both halves of the problem, so it is not a trade.
-CODE_MIXED_STATES: frozenset[State] = frozenset({State.COLLECT_DATA})
+# Within COLLECT_DATA it depends on the FIELD, not the state. Measured:
+# code-mix mode preserved `account` and spelled राठौड़ correctly, but the
+# default mode's normalisation is what turned spoken words into `1 जनवरी 1990`
+# and `₹500` -- which is exactly what the extractor downstream wants. So a
+# name wants code-mix and a date does not, and one setting for the whole state
+# has to be wrong about one of them.
+CODE_MIXED_FIELDS: frozenset[str] = frozenset({"full_name", "address", "occupation"})
 
 
-def expectation_for(state: State) -> Expectation:
+def expectation_for(state: State, field: str | None = None) -> Expectation:
     """What kind of speech to tell the recogniser to expect.
 
     Deliberately NOT "detect the language". Letting the vendor auto-detect
@@ -88,9 +95,10 @@ def expectation_for(state: State) -> Expectation:
     that is occasionally misspelled. The conversation's language stays the
     language; only the expectation of English *inside* it changes.
     """
-    if state in CODE_MIXED_STATES:
-        return Expectation.CODE_MIXED
-    return Expectation.PLAIN
+    if state is not State.COLLECT_DATA:
+        return Expectation.PLAIN
+    # No field named means nothing specific is being asked for yet.
+    return Expectation.CODE_MIXED if field in CODE_MIXED_FIELDS else Expectation.PLAIN
 
 
 def floor_for(state: State) -> float:

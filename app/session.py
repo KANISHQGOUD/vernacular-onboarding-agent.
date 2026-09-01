@@ -49,6 +49,16 @@ class Session:
     # both live in one dict. Never put personal data in here.
     notes: dict[str, str] = field(default_factory=dict)
 
+    # What the recogniser actually returned for each field, before any
+    # normalising. `applicant` holds what was recorded; this holds what was
+    # heard, and when somebody disputes a field afterwards that difference is
+    # the whole question.
+    #
+    # PERSONAL DATA, so it is erased with the rest and never reaches the audit
+    # trail -- every `detail` there is structural, and that is what lets an
+    # append-only log coexist with a deletion request.
+    heard: dict[str, str] = field(default_factory=dict)
+
     # Both halves of the screening are kept: the answers that went in, and the
     # verdict that came out. eligibility.py promises a decision can be replayed
     # from its stored input years later -- that promise is only real if the
@@ -125,6 +135,7 @@ class Session:
         (the person's date of birth and residency) is not.
         """
         self.applicant.clear()
+        self.heard.clear()
         self.eligibility_input = None
 
     # -- Persistence --------------------------------------------------------
@@ -136,6 +147,7 @@ class Session:
             "language": self.language,
             "consent_recorded": self.consent_recorded,
             "applicant": dict(self.applicant),
+            "heard": dict(self.heard),
             "notes": dict(self.notes),
             "eligibility_input": (
                 self.eligibility_input.to_dict() if self.eligibility_input else None
@@ -156,6 +168,7 @@ class Session:
             language=raw["language"],
             consent_recorded=raw["consent_recorded"],
             applicant=dict(raw["applicant"]),
+            heard=dict(raw.get("heard", {})),
             notes=dict(raw.get("notes", {})),
             eligibility_input=(
                 EligibilityInput.from_dict(raw["eligibility_input"])
