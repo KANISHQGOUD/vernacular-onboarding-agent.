@@ -90,6 +90,7 @@
   <button id="mic" disabled title="Hold a conversation out loud">&#127908; Speak</button>
   <label class="toggle"><input type="checkbox" id="tts" checked> speak replies</label>
   <label class="toggle"><input type="checkbox" id="handsfree"> hands-free</label>
+  <label class="toggle" title="Opens a SECOND microphone stream for the level meter. Chrome's recogniser already has its own; on some machines the two conflict and the recogniser gets silence."><input type="checkbox" id="meterOn"> mic meter</label>
   <div id="meter" title="microphone level; red means speech detected"><div id="level"></div></div>
   <button id="retry" hidden>Reconnect</button>
 </footer>
@@ -105,6 +106,7 @@ const retry = document.getElementById("retry");
 const mic = document.getElementById("mic");
 const tts = document.getElementById("tts");
 const handsfree = document.getElementById("handsfree");
+const meterOn = document.getElementById("meterOn");
 const meter = document.getElementById("meter");
 const level = document.getElementById("level");
 
@@ -143,6 +145,7 @@ let listening = false;
 let player = null;   // the <audio> playing a server-synthesised reply
 let heardSoFar = "";
 let bestConfidence = null;
+let sawAnyResult = false;
 // The machine chooses the language and tells us. The browser never guesses it:
 // re-detecting per utterance would let one mumbled sentence switch somebody
 // into a language they cannot read.
@@ -497,11 +500,12 @@ async function startDetector({ onSpeechEnd, onGaveUp }) {
   raf = setInterval(tick, TICK_MS);
 }
 
-// The safety net described above. Cleared whenever the turn ends by any
+// The endpoint. Every result pushes it back; when results stop arriving for
+// the state's window, the turn is over. Cleared whenever the turn ends by any
 // route, so it cannot fire into a finished turn.
 let fallbackStop = null;
 
-function armFallbackStop() {
+function armFallbackStop(afterMs) {
   clearTimeout(fallbackStop);
   fallbackStop = setTimeout(() => {
     if (!listening) return;
@@ -513,7 +517,7 @@ function armFallbackStop() {
       heardSoFar = recogState.lastTranscript;
     }
     try { recognition.stop(); } catch (e) {}
-  }, turnPolicy.silence_ms + 400);   // a beat behind the VAD, so it defers
+  }, afterMs !== undefined ? afterMs : turnPolicy.silence_ms);
 }
 
 function stopDetector() {
@@ -538,19 +542,35 @@ function startListening() {
   heardSoFar = "";
   bestConfidence = null;
   interruptedThisTurn = false;
+  sawAnyResult = false;
   recogState = {
     started: 0, results: 0, interim: 0, finals: 0, ended: 0,
     lastError: null, lastTranscript: "",
   };
 
-  startDetector({
-    onSpeechEnd: () => { try { recognition.stop(); } catch (e) {} },
-    onGaveUp: () => { try { recognition.stop(); } catch (e) {} },
-  }).catch(err => {
-    // No microphone, or permission refused. Fall back to Chrome's own
-    // endpointing rather than leaving the button dead.
-    note("Microphone unavailable for turn detection: " + err.name);
-  });
+  // Endpointing runs off the RECOGNISER's results, not off a second
+  // microphone. Chrome's SpeechRecognition opens its own capture, and opening
+  // another with getUserMedia made two consumers compete for one device --
+  // on some machines the recogniser loses and receives silence, which looks
+  // from outside exactly like "the mic is listening and nothing happens".
+  //
+  // Results are the signal that is guaranteed to exist whenever recognition
+  // is working at all, so turn-taking is built on them. The per-state windows
+  // from turn_taking.py apply unchanged: what differs is only how "they are
+  // still talking" is observed.
+  //
+  // The Web Audio detector is now opt-in, for the level meter and for
+  // barge-in that reacts to sound the recogniser never transcribes. Useful,
+  // and not worth risking the whole conversation on.
+  if (meterOn.checked) {
+    startDetector({
+      onSpeechEnd: () => { try { recognition.stop(); } catch (e) {} },
+      onGaveUp: () => { try { recognition.stop(); } catch (e) {} },
+    }).catch(err => note("Level meter unavailable: " + err.name));
+  }
+
+  // Nobody speaks at all: end the turn rather than listening forever.
+  armFallbackStop(turnPolicy.patience_ms);
 
   recognition.onstart = () => {
     recogState.started++;
@@ -623,6 +643,17 @@ function startListening() {
   // the audio rather than waiting on a recogniser that has already decided.
   recognition.onresult = (event) => {
     recogState.results++;
+
+    // Barge-in, from the recogniser. The audio detector does this sooner when
+    // it is on, but it must not be the ONLY way -- a person talking over the
+    // agent has to be able to stop it whether or not the meter is enabled.
+    if (!sawAnyResult) {
+      sawAnyResult = true;
+      if (agentIsTalking()) {
+        interruptedThisTurn = true;
+        stopSpeaking();
+      }
+    }
 
     // Armed on ANY result, interim included. This was finals-only, and with
     // continuous=true Chrome frequently emits nothing final until stop() is
