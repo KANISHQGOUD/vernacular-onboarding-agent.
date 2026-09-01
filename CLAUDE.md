@@ -69,6 +69,31 @@ guard says otherwise", on the entrance that opens a bank account. Not worth it.
 `Actions.record_lapse()` writes the fact to the trail and counts it in
 `session.lapses`, which survives both the resume and `erase_personal_data()`.
 
+### Collected fields are checked, read back, and never a dead end
+
+`app/flow/fields.py` holds the rules as data, like `eligibility.py`, and takes
+an explicit `as_of` so a rejection replays. A mobile is ten digits beginning
+6-9; a date of birth must parse and give an age of 18 to 120. Until these
+existed `save_applicant_field` accepted any string, and the collected date was
+never parsed anywhere -- `_screen` passes a hardcoded one to eligibility.
+
+**Three attempts, then the applicant wins.** Every rule is a guess about what a
+real answer looks like and each is wrong about somebody, so after the budget
+the value is stored with an `unvalidated:` flag and a FIELD_UNVALIDATED audit
+row. A rule that fires constantly is wrong about a population, not a
+population that keeps mis-speaking -- and the flag is how you find out.
+
+**Mobile, date of birth and name are read back before being written down**
+(`hearing.CONFIRMED_FIELDS`), staged rather than stored so a "no" never has to
+un-write anything. The act carries `verbatim=("value",)`, because a model that
+respells a name has replaced the thing being checked. Three denials walks
+ask -> spell -> HUMAN_HANDOFF: asking a third time identically is the machine
+insisting at somebody who has already said it correctly twice.
+
+This is all here because Sarvam reports no transcription confidence, so the
+floors below are inert against the provider actually in use. Deterministic
+checks and human confirmation do not depend on a vendor.
+
 ### How sure we have to be before acting on speech
 
 `app/flow/hearing.py`. The floor tracks **the cost of acting on a mishearing,
@@ -92,17 +117,17 @@ and spends one request from a 20/day quota.
 
 ## Current state
 
-Branch `master`, 24 commits, tree clean.
+Branch `master`, 40 commits, tree clean.
 
-**944 tests pass, ~6s.** 922 need no network and no keys; 22 need
-Postgres. One more is skipped by default: the live Sarvam round trip, which
-runs only under `SARVAM_LIVE=1` because it spends prepaid credit.
+**1052 tests pass, ~6s.** 1030 need no network and no keys; 22 need Postgres.
+One more is skipped by default: the live Sarvam round trip, which runs only
+under `SARVAM_LIVE=1` because it spends prepaid credit.
 
 | | count |
 |---|---|
-| states / events / tools | 15 / 17 / 10 |
-| transition rows / terminal states | 43 / 5 |
-| speech acts / audit kinds / languages | 15 / 7 / 11 |
+| states / events / tools | 15 / 19 / 10 |
+| transition rows / terminal states | 45 / 5 |
+| speech acts / audit kinds / languages | 19 / 10 / 11 |
 
 Terminal states: `COMPLETED`, `DECLINED`, `CONSENT_REFUSED`, `ABANDONED`,
 `HUMAN_HANDOFF`. Each is a different reason, because a funnel is only readable
@@ -132,8 +157,17 @@ Always `.venv\Scripts\python.exe`. Never bare `python`.
 .venv\Scripts\python.exe -m uvicorn app.web.server:app --port 8000
 ```
 
-Postgres (start Docker Desktop **from the Start menu** — it will not start from
-a background process):
+Postgres needs the Docker daemon, which needs Docker Desktop running. Try
+this first — it worked on 2026-09-02, daemon up in five seconds:
+
+```bash
+Start-Process "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
+```
+
+If `docker info` still fails after ~30s, launch it from the Start menu
+instead. This note used to say a background launch never works; that was the
+experience once and was not true the next time, so treat the Start menu as the
+fallback rather than the only route.
 
 ```bash
 docker start onboarding-db
