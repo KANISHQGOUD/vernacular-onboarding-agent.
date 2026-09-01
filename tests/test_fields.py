@@ -303,3 +303,74 @@ def test_corrections_survive_erasure_but_the_value_does_not():
     assert session.pending_field is None
     assert session.pending_value is None
     assert session.corrections("full_name") == 1
+
+
+# ---------------------------------------------------------------------------
+# When asking is not working, stop asking the same way.
+# ---------------------------------------------------------------------------
+
+
+def test_the_tactic_changes_rather_than_repeating():
+    """Somebody read back the wrong value twice has already said it correctly
+    twice. A third identical question is the machine insisting."""
+    from app.flow.hearing import next_tactic
+
+    assert next_tactic(0) == "ask"
+    assert next_tactic(1) == "ask"
+    assert next_tactic(2) == "spell"
+    assert next_tactic(3) == "escalate"
+    assert next_tactic(9) == "escalate"
+
+
+def test_three_denials_reach_a_person_rather_than_a_wall():
+    """The end of the budget is a handoff, not a refusal. Same shape as the
+    KYC retry budget: a machine that cannot do this says so and gets somebody
+    who can."""
+    from datetime import date
+
+    from app.conversation import Conversation
+    from app.llm.phrasing import Phraser
+    from tests.test_conversation import Classification, FakeReader
+
+    audit = InMemoryAuditSink()
+    machine = Machine(audit)
+    actions = Actions(
+        machine=machine,
+        kyc=MockKycProvider(),
+        core_banking=MockCoreBanking(),
+        payments=MockPaymentRail(),
+    )
+    readings = []
+    for _ in range(3):
+        readings += [
+            Classification(Event.DATA_PROVIDED, "full_name", "Asha Devri"),
+            Classification(Event.FIELD_CORRECTED),
+        ]
+    conversation = Conversation(
+        actions, FakeReader(*readings), Phraser(client=None), as_of=date(2026, 9, 2)
+    )
+
+    session = Session(session_id="ladder", state=State.COLLECT_DATA)
+    replies = []
+    for _ in range(3):
+        conversation.respond(session, "my name is ...")
+        replies.append(conversation.respond(session, "no that is wrong"))
+
+    # Ask, then spell, then a person.
+    assert "one letter" in replies[1].text.lower()
+    assert session.state is State.HUMAN_HANDOFF
+    assert "full_name" in session.notes["escalation_reason"]
+
+
+def test_the_spelling_request_does_not_blame_them():
+    """They have said it correctly twice and been told it was wrong. The
+    difficulty belongs to the machine."""
+    from app.llm.speech_acts import SPEECH_ACTS, SpeechActKind
+
+    spec = SPEECH_ACTS[SpeechActKind.ASK_TO_SPELL]
+    spoken = spec.fallback.lower()
+
+    assert "sorry" in spoken
+    assert "i'm still not getting" in spoken or "not getting that right" in spoken
+    for blame in ("you said", "you were", "your mistake", "speak up"):
+        assert blame not in spoken

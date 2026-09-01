@@ -59,6 +59,7 @@ class SpeechActKind(StrEnum):
     ADMIT_OUR_FAULT = "ADMIT_OUR_FAULT"
     FIELD_NOT_USABLE = "FIELD_NOT_USABLE"
     CONFIRM_FIELD = "CONFIRM_FIELD"
+    ASK_TO_SPELL = "ASK_TO_SPELL"
     HANDING_TO_HUMAN = "HANDING_TO_HUMAN"
     DID_NOT_UNDERSTAND = "DID_NOT_UNDERSTAND"
 
@@ -177,6 +178,20 @@ SPEECH_ACTS: Mapping[SpeechActKind, SpeechActSpec] = MappingProxyType(
                 # would be confirming something they never said.
                 verbatim=("value",),
                 fallback="I have your {field_label} as {value}. Is that right?",
+            ),
+            SpeechActSpec(
+                kind=SpeechActKind.ASK_TO_SPELL,
+                intent=(
+                    "Asking normally has not worked twice. Ask them to say "
+                    "the field named in field_label one letter or one digit "
+                    "at a time. Be warm about it and put the difficulty on "
+                    "the machine, not on them -- they have already said it "
+                    "correctly twice and been told it was wrong."
+                ),
+                fallback=(
+                    "I'm still not getting that right, sorry. Could you say "
+                    "your {field_label} slowly, one letter at a time?"
+                ),
             ),
             SpeechActSpec(
                 kind=SpeechActKind.ANNOUNCE_DECLINE,

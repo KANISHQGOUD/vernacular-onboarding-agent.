@@ -42,6 +42,7 @@ from typing import Callable, Mapping
 from app.audit import AuditKind
 from app.flow.actions import ActionRefused, Actions, FieldRejected
 from app.flow.fields import FIELD_ORDER, next_field
+from app.flow.hearing import next_tactic
 from app.flow.eligibility import DeclineReason, Residency
 from app.flow.intents import UntrustedEventError
 from app.flow.machine import FlowError
@@ -340,6 +341,8 @@ class Conversation:
             log.info("%s with nothing pending in %s", intent, session.state)
             return self._reply(session, moved=False, understood=False)
 
+        denied = session.pending_field
+
         try:
             # Fire first, then move the data: the machine decides whether a
             # confirmation counts, and writing before it accepted the event
@@ -352,6 +355,44 @@ class Conversation:
         except FlowError:
             log.info("refused %s in %s", intent, session.state)
             return self._reply(session, moved=False, understood=False)
+
+        if intent is Event.FIELD_CORRECTED and denied:
+            return self._after_a_denial(session, denied)
+
+        self._advance(session)
+        return self._reply(session, moved=True, understood=True)
+
+    def _after_a_denial(self, session: Session, field_name: str) -> Reply:
+        """Asking the same way again is asking them to fail again.
+
+        Somebody who has been read back the wrong value twice has already
+        said it correctly twice. Repeating the question a third time is the
+        machine insisting; spelling is a different task, and a person is the
+        honest end of the budget.
+        """
+        tactic = next_tactic(session.corrections(field_name))
+
+        if tactic == "escalate":
+            log.info("escalating on %s after %s denials", field_name, session.corrections(field_name))
+            self.actions.escalate_to_human(
+                session, f"could not capture {field_name} by voice"
+            )
+            self.actions.machine.fire(session, Event.USER_WANTS_HUMAN)
+            return self._reply(session, moved=True, understood=True)
+
+        if tactic == "spell":
+            return Reply(
+                text=self.phraser.say(
+                    SpeechAct(
+                        kind=SpeechActKind.ASK_TO_SPELL,
+                        language=session.language or DEFAULT_LANGUAGE,
+                        data={"field_label": FIELD_LABELS.get(field_name, "answer")},
+                    )
+                ),
+                state=session.state,
+                moved=False,
+                understood=True,
+            )
 
         self._advance(session)
         return self._reply(session, moved=True, understood=True)

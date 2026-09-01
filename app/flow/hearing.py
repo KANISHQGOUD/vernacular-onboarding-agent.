@@ -101,6 +101,26 @@ def needs_confirming(field: str) -> bool:
     return field in CONFIRMED_FIELDS
 
 
+# How many denied read-backs before changing tactic, and before giving up.
+# Two is where a person stops believing the machine can hear them; asking a
+# third time in the same way is asking them to fail again.
+#
+#   after 1   ask again, normally
+#   after 2   ask them to spell it -- letter by letter is a different task,
+#             not a louder version of the one that failed
+#   after 3   a person takes over. Same shape as MAX_KYC_ATTEMPTS: a budget,
+#             and the end of it is a handoff rather than a wall.
+SPELL_AFTER_CORRECTIONS = 2
+ESCALATE_AFTER_CORRECTIONS = 3
+
+
+def next_tactic(corrections: int) -> str:
+    """What to do after this many denied read-backs of one field."""
+    if corrections >= ESCALATE_AFTER_CORRECTIONS:
+        return "escalate"
+    if corrections >= SPELL_AFTER_CORRECTIONS:
+        return "spell"
+    return "ask"
 def expectation_for(state: State, field: str | None = None) -> Expectation:
     """What kind of speech to tell the recogniser to expect.
 
