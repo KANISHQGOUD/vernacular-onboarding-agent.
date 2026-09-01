@@ -149,6 +149,8 @@ let sawAnyResult = false;
 // Set by the server. When true the page records audio and sends it for
 // transcription instead of relying on Chrome's recogniser.
 let serverStt = false;
+let announcedMode = false;
+let announcedDevice = false;
 // The machine chooses the language and tells us. The browser never guesses it:
 // re-detecting per utterance would let one mumbled sentence switch somebody
 // into a language they cannot read.
@@ -632,6 +634,12 @@ async function recordTurn() {
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   });
 
+  const track = stream.getAudioTracks()[0];
+  if (track && !announcedDevice) {
+    announcedDevice = true;
+    note("Recording from: " + (track.label || "default input"));
+  }
+
   const mimeType = pickMimeType();
   const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
   const chunks = [];
@@ -936,7 +944,19 @@ function connect() {
     // when somebody asks to switch, and the voice has to follow with it.
     if (data.language) language = data.language;
     if (data.turn) turnPolicy = data.turn;
-    if (typeof data.server_stt === "boolean") serverStt = data.server_stt;
+    if (typeof data.server_stt === "boolean") {
+      const changed = serverStt !== data.server_stt;
+      serverStt = data.server_stt;
+      // Say which voice path is live, once. Two rounds of debugging were
+      // spent not knowing whether the page had actually picked up a change,
+      // and "which mode am I in" should never be a guess.
+      if (!announcedMode || changed) {
+        announcedMode = true;
+        note(serverStt
+          ? "Voice: recording in the browser, transcribed by Sarvam on the server."
+          : "Voice: Chrome's own recogniser (free, but silent on some machines).");
+      }
+    }
     const voice = data.audio ? " &middot; sarvam voice" : "";
     bubble("agent", data.text, movement + understood + voice);
     recordState(data.state, data.moved);
