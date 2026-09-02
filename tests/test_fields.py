@@ -172,7 +172,7 @@ def test_the_applicant_gets_the_last_word():
     # party who knows.
     actions.save_applicant_field(session, "mobile", "12345", as_of=AS_OF)
     assert session.pending_field == "mobile"
-    actions.confirm_pending_field(session)
+    actions.confirm_pending_field(session, as_of=AS_OF)
 
     assert session.applicant["mobile"] == "12345"
     assert session.notes["unvalidated:mobile"]
@@ -286,7 +286,7 @@ def test_confirming_the_last_field_still_completes_the_set():
     actions.save_applicant_field(session, "full_name", data["full_name"], as_of=AS_OF)
     assert session.state is State.COLLECT_DATA, "completed before it was agreed"
 
-    actions.confirm_pending_field(session)
+    actions.confirm_pending_field(session, as_of=AS_OF)
     assert session.state is State.KYC_HANDOFF
 
 
@@ -374,3 +374,161 @@ def test_the_spelling_request_does_not_blame_them():
     assert "i'm still not getting" in spoken or "not getting that right" in spoken
     for blame in ("you said", "you were", "your mistake", "speak up"):
         assert blame not in spoken
+
+
+# ---------------------------------------------------------------------------
+# The shapes a date arrives in when the extractor only half-worked.
+# ---------------------------------------------------------------------------
+
+
+def test_a_date_in_devanagari_digits_is_the_same_date():
+    """`digits_only` has always folded these for phone numbers, and `as_date`
+    did not -- so a date transcribed in Hindi numerals was rejected as "not a
+    date" by the one product that should expect them most.
+
+    The separatorless form is the one that pins the FOLD. Python's `\d` and
+    `int()` are both Unicode-aware, so the dashed form is rescued by the loose
+    pattern below even with no fold at all -- which a first version of this
+    test did not distinguish, and passed against the unfixed code.
+    """
+    assert as_date("१९९०-०१-०१") == date(1990, 1, 1)
+    assert as_date("१९९००१०१") == date(1990, 1, 1)
+    assert validate("date_of_birth", "१९९०-०१-०१", as_of=AS_OF) is None
+
+
+def test_a_bare_year_is_the_first_of_january():
+    """Ask an older applicant their date of birth and a year alone is a common
+    and honest answer. A large share of Indian records carry 1 January for
+    exactly that reason, so this follows the convention those records use
+    rather than refusing the person three times."""
+    assert as_date("1990") == date(1990, 1, 1)
+    assert as_date("१९९०") == date(1990, 1, 1)
+    assert validate("date_of_birth", "1990", as_of=AS_OF) is None
+
+
+def test_an_assumed_day_says_so():
+    """The stored date cannot tell you whether the day was real."""
+    actions, session, _ = rig()
+    save_field(actions, session, "date_of_birth", "1990")
+
+    assert session.applicant["date_of_birth"] == "1990"
+    assert "year only" in session.notes["inferred:date_of_birth"]
+
+
+def test_a_real_day_is_not_flagged_as_assumed():
+    actions, session, _ = rig()
+    save_field(actions, session, "date_of_birth", "1990-01-01")
+    assert "inferred:date_of_birth" not in session.notes
+
+
+def test_an_unpadded_date_still_parses():
+    """`fromisoformat` refuses `1990-1-1` over zero padding alone."""
+    assert as_date("1990-1-1") == date(1990, 1, 1)
+
+
+def test_nonsense_is_still_nonsense():
+    """The fallbacks are for extraction that half-worked, not a free-text
+    parser -- so the things that should fail still do."""
+    for junk in ("1990-13-01", "1990-02-30", "01/01/1990", "1 January 1990", "", "yes"):
+        assert as_date(junk) is None, junk
+
+
+# ---------------------------------------------------------------------------
+# The age gate. Recognition rules give up; the law does not.
+# ---------------------------------------------------------------------------
+
+
+def _screened_session():
+    """A session that has already passed the pre-screen, as a real one has."""
+    from app.flow.eligibility import evaluate
+    from tests.conftest import eligible_applicant
+
+    audit = InMemoryAuditSink()
+    actions = Actions(
+        machine=Machine(audit),
+        kyc=MockKycProvider(),
+        core_banking=MockCoreBanking(),
+        payments=MockPaymentRail(),
+    )
+    session = Session(session_id="gate", state=State.COLLECT_DATA)
+    session.eligibility_input = eligible_applicant()
+    session.eligibility = evaluate(session.eligibility_input)
+    assert session.eligibility.passed, "the pre-screen fixture should pass"
+    return actions, session, audit
+
+
+def test_a_minor_is_declined_even_after_the_escape_hatch_accepts_the_date():
+    """The two halves of this only fail together, which is why they are tested
+    together.
+
+    `save_applicant_field` gives up after three attempts and stores the value
+    anyway -- correct, because its rules are guesses about recognition and each
+    is wrong about somebody. But the pre-screen ran on a placeholder date, so
+    before this the age rule had never seen the real one, and a 17-year-old who
+    simply repeated themselves three times was onboarded.
+
+    Recognition rules give up. Eligibility does not.
+    """
+    actions, session, _ = _screened_session()
+    minor = "2009-01-01"          # 17 on AS_OF
+
+    for _ in range(MAX_FIELD_ATTEMPTS - 1):
+        with pytest.raises(FieldRejected):
+            actions.save_applicant_field(session, "date_of_birth", minor, as_of=AS_OF)
+
+    actions.save_applicant_field(session, "date_of_birth", minor, as_of=AS_OF)
+    actions.confirm_pending_field(session, as_of=AS_OF)
+
+    assert session.state is State.DECLINED
+    assert not session.eligibility.passed
+    assert [str(r) for r in session.eligibility.decline_reasons] == ["MINOR_NEEDS_GUARDIAN"]
+
+
+def test_the_rules_are_re_run_on_the_date_they_actually_gave_us():
+    """The pre-screen decided on an answer given before this was ever spoken."""
+    actions, session, _ = _screened_session()
+    before = session.eligibility_input.date_of_birth
+
+    save_field(actions, session, "date_of_birth", "1990-01-01")
+
+    assert session.eligibility_input.date_of_birth == date(1990, 1, 1)
+    assert session.eligibility_input.date_of_birth != before or before == date(1990, 1, 1)
+    assert session.state is State.COLLECT_DATA
+
+
+def test_an_adult_is_not_declined_by_the_re_screen():
+    """The guard has to let people through, or it is just a wall."""
+    actions, session, _ = _screened_session()
+    save_field(actions, session, "date_of_birth", "1990-01-01")
+    assert session.state is State.COLLECT_DATA
+    assert session.eligibility.passed
+
+
+def test_the_decline_is_audited_as_a_transition_not_a_field_problem():
+    """A declined applicant left COLLECT_DATA. The trail has to say so, or the
+    funnel counts them as still collecting."""
+    actions, session, audit = _screened_session()
+    minor = "2009-01-01"
+    for _ in range(MAX_FIELD_ATTEMPTS - 1):
+        with pytest.raises(FieldRejected):
+            actions.save_applicant_field(session, "date_of_birth", minor, as_of=AS_OF)
+    actions.save_applicant_field(session, "date_of_birth", minor, as_of=AS_OF)
+    actions.confirm_pending_field(session, as_of=AS_OF)
+
+    moves = [
+        (e.from_state, e.to_state)
+        for e in audit.for_session("gate")
+        if e.kind is AuditKind.TRANSITION_ACCEPTED
+    ]
+    assert (str(State.COLLECT_DATA), str(State.DECLINED)) in moves
+
+
+def test_a_session_with_no_pre_screen_is_left_alone():
+    """Re-screening invents nothing. Without a pre-screen there are no other
+    answers to combine the date with, and deciding on data nobody supplied
+    would be worse than not deciding."""
+    actions, session, _ = rig()          # no eligibility_input
+    save_field(actions, session, "date_of_birth", "1990-01-01")
+
+    assert session.state is State.COLLECT_DATA
+    assert session.eligibility is None

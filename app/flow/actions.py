@@ -36,7 +36,7 @@ the provider layer's.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 
 from app.flow.eligibility import EligibilityInput, Residency, evaluate
@@ -44,12 +44,14 @@ from app.flow.hearing import needs_confirming
 from app.flow.fields import (
     MAX_FIELD_ATTEMPTS,
     FieldProblem,
+    as_date,
+    is_year_only,
     normalised,
     validate,
 )
 from app.audit import AuditKind
 from app.flow.machine import Machine
-from app.flow.states import Event, ToolName
+from app.flow.states import Event, State, ToolName
 from app.providers.core_banking import CoreBankingProvider
 from app.providers.kyc import KycProvider, KycStatus
 from app.providers.payments import (
@@ -166,6 +168,12 @@ class Actions:
                 detail=f"{field_name} stored after {attempts} attempts: {problem}",
             )
 
+        # A bare year became 1 January. Recorded, because "was this day real
+        # or assumed" is a question a reviewer will eventually ask, and the
+        # stored date cannot answer it on its own.
+        if field_name == "date_of_birth" and is_year_only(value):
+            session.notes["inferred:date_of_birth"] = "year only; day assumed 1 January"
+
         clean = normalised(field_name, value)
 
         # High-stakes fields are read back before they are written down. See
@@ -176,10 +184,12 @@ class Actions:
             session.pending_value = clean
             return session
 
-        return self._commit_field(session, field_name, clean)
+        return self._commit_field(session, field_name, clean, as_of=as_of)
 
-    def _commit_field(self, session: Session, field_name: str, value: str) -> Session:
-        """Write it down, and fire completion if that was the last one.
+    def _commit_field(
+        self, session: Session, field_name: str, value: str, *, as_of: date
+    ) -> Session:
+        """Write it down, re-screen if it changes the verdict, then finish.
 
         Shared by the confirmed and unconfirmed paths, because "was that the
         final field" must be answered the same way regardless of how the value
@@ -188,11 +198,54 @@ class Actions:
         """
         session.applicant[field_name] = value
 
+        if field_name == "date_of_birth":
+            session = self._rescreen_eligibility(session, value, as_of=as_of)
+            # Declined. Nothing further is collected, and firing completion
+            # from a terminal state would be illegal anyway.
+            if session.state is not State.COLLECT_DATA:
+                return session
+
         if session.required_data_complete:
             return self.machine.fire(session, Event.REQUIRED_DATA_COMPLETE)
         return session
 
-    def confirm_pending_field(self, session: Session) -> Session:
+    def _rescreen_eligibility(
+        self, session: Session, value: str, *, as_of: date
+    ) -> Session:
+        """Ask the ruleset again, using the date they actually gave us.
+
+        WHY THIS HAS TO EXIST
+        ---------------------
+        ELIGIBILITY runs before COLLECT_DATA, on pre-screen answers. That
+        ordering is right -- there is no point collecting five fields from
+        somebody the rules will decline -- but it meant the age rule was
+        evaluated against an answer given before the real date of birth was
+        ever spoken, and `Conversation._screen` supplies a placeholder. The
+        engine has always been able to decline a minor; it was simply never
+        shown one.
+
+        So the pre-screen stays a screen, and this is the check. The field
+        rules in fields.py are about RECOGNITION -- could we have heard that
+        -- and they rightly give up after three attempts and let the applicant
+        win. Eligibility is about LAW, and does not give up. Keeping those
+        separate is what lets the escape hatch stay generous without it
+        becoming a way through the age gate.
+
+        Silent when there was no pre-screen to revise: a session that reached
+        COLLECT_DATA without one has no other answers to combine this with,
+        and inventing them here would be deciding on data nobody supplied.
+        """
+        prior = session.eligibility_input
+        born = as_date(value)
+        if prior is None or born is None:
+            return session
+
+        applicant = replace(prior, date_of_birth=born, as_of=as_of)
+        session.eligibility_input = applicant
+        session.eligibility = evaluate(applicant)
+        return self.machine.fire(session, Event.ELIGIBILITY_CHECKED)
+
+    def confirm_pending_field(self, session: Session, *, as_of: date) -> Session:
         """They said yes. Write it down.
 
         Does NOT fire FIELD_CONFIRMED, and that is the rule this file lives
@@ -208,7 +261,7 @@ class Actions:
 
         if field_name is None or value is None:
             return session
-        return self._commit_field(session, field_name, value)
+        return self._commit_field(session, field_name, value, as_of=as_of)
 
     def reject_pending_field(self, session: Session) -> Session:
         """They said no. Forget it and count the miss.

@@ -118,7 +118,23 @@ class Conversation:
     actions: Actions
     classifier: GeminiIntentClassifier
     phraser: Phraser
-    as_of: date = field(default_factory=date.today)
+
+    # None means "whatever day it is when the turn happens". A fixed date
+    # pins it, which is what the tests want and what a replay would want.
+    #
+    # This used to be `field(default_factory=date.today)`, which reads the
+    # clock ONCE -- when the Conversation is built. `create_app` builds one at
+    # startup and shares it across every socket, so a server left running for
+    # a week aged every applicant against the day it booted, and somebody who
+    # turned 18 on Wednesday was still 17 on Friday. eligibility.py takes an
+    # explicit `as_of` precisely so decisions do not depend on a clock; this
+    # was the caller quietly freezing that clock instead of supplying the date
+    # the conversation is actually happening on.
+    as_of: date | None = None
+
+    def today(self) -> date:
+        """The date this turn is happening on."""
+        return self.as_of if self.as_of is not None else date.today()
 
     # -- The turn -----------------------------------------------------------
 
@@ -253,7 +269,7 @@ class Conversation:
         if reading.carries_data and session.state is State.COLLECT_DATA:
             try:
                 self.actions.save_applicant_field(
-                    session, reading.field, reading.value, as_of=self.as_of
+                    session, reading.field, reading.value, as_of=self.today()
                 )
             except FieldRejected as rejected:
                 # Not an error and not their mistake: recognition produced
@@ -349,7 +365,7 @@ class Conversation:
             # would be writing on our own authority.
             self.actions.machine.fire(session, intent)
             if intent is Event.FIELD_CONFIRMED:
-                self.actions.confirm_pending_field(session)
+                self.actions.confirm_pending_field(session, as_of=self.today())
             else:
                 self.actions.reject_pending_field(session)
         except FlowError:
@@ -506,7 +522,7 @@ class Conversation:
             has_form_60=False,
             mobile=session.applicant.get("mobile", "9812345678"),
             mobile_linked_to_aadhaar=True,
-            as_of=self.as_of,
+            as_of=self.today(),
         )
 
     def _dispatch_kyc(self, session: Session) -> None:

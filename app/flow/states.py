@@ -253,6 +253,29 @@ TRANSITIONS: dict[tuple[State, Event], tuple[Transition, ...]] = {
         ),
     ),
 
+    # Re-screening, once the applicant's REAL date of birth is known.
+    #
+    # The pre-screen at ELIGIBILITY runs on answers given before any of this
+    # was collected, so until now the ruleset never saw the date the caller
+    # actually gave -- it decided on a placeholder and always passed. These
+    # two rows are the same shape as the ELIGIBILITY pair above, deliberately:
+    # a guard on the verdict, and an unconditional decline behind it.
+    #
+    # This is the one place a session can leave COLLECT_DATA for DECLINED, and
+    # the LLM still has no say in it: ELIGIBILITY_CHECKED is a FACT, minted by
+    # `Actions._rescreen_eligibility` from versioned rules.
+    (State.COLLECT_DATA, Event.ELIGIBILITY_CHECKED): (
+        Transition(
+            State.COLLECT_DATA,
+            guard=lambda s: s.eligibility_passed,
+            why="The rules still pass on the date they actually gave us.",
+        ),
+        Transition(
+            State.DECLINED,
+            why="The real date of birth fails a rule the placeholder did not.",
+        ),
+    ),
+
     # -- COLLECT_DATA --------------------------------------------------------
     (State.COLLECT_DATA, Event.DATA_PROVIDED): (
         Transition(State.COLLECT_DATA, why="One field captured; stay here for the rest."),

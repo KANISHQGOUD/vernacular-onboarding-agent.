@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import re
 from typing import Callable
 
 from app.flow.eligibility import age_on
@@ -87,18 +88,77 @@ def digits_only(value: str) -> str:
     return "".join(ch for ch in value.translate(DIGIT_MAP) if ch in "0123456789")
 
 
+# `1990-1-1` -- a real date that `fromisoformat` refuses over zero padding.
+_LOOSE_ISO = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+
+# A bare year, and the most important shape after ISO. See `as_date`.
+_YEAR_ONLY = re.compile(r"(\d{4})")
+
+
 def as_date(value: str) -> date | None:
     """ISO first, because that is what the extractor produces.
 
     The classifier returns dates already structured -- a date spoken entirely
     in Hindi words comes back as `1990-01-01` with no date parser involved --
-    so ISO is the expected shape and anything else is a signal that extraction
-    did not happen.
+    so ISO is the expected shape, and the three fallbacks below are for when
+    extraction half-worked rather than for parsing free text.
+
+    DIGITS ARE FOLDED FIRST
+    -----------------------
+    `१९९०-०१-०१` is the same date as `1990-01-01`, and Sarvam transcribing
+    spoken Hindi numerals may return either. This is the same fold
+    `digits_only` applies to mobile numbers, and leaving it out here meant
+    a date in Devanagari digits was rejected as "not a date" -- exactly the
+    failure this module's own docstring warns about for phones.
+
+    A BARE YEAR IS A DATE
+    ---------------------
+    Ask an older applicant their date of birth and "1990" is a common and
+    honest answer: a large share of Indian records carry 1 January precisely
+    because the exact day was never recorded. Refusing it three times and then
+    storing it unvalidated turns that into a failure, on the population this
+    product exists for. So a year alone becomes 1 January of that year, which
+    is the convention those records already use.
+
+    The inference is not silent -- `Actions.save_applicant_field` notes it, so
+    "was this day real or assumed" stays answerable afterwards.
     """
-    try:
-        return date.fromisoformat(value.strip())
-    except (ValueError, AttributeError):
+    if not isinstance(value, str):
         return None
+
+    text = value.strip().translate(DIGIT_MAP)
+
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        pass
+
+    loose = _LOOSE_ISO.fullmatch(text)
+    if loose:
+        try:
+            return date(int(loose[1]), int(loose[2]), int(loose[3]))
+        except ValueError:
+            return None
+
+    year = _YEAR_ONLY.fullmatch(text)
+    if year:
+        try:
+            return date(int(year[1]), 1, 1)
+        except ValueError:
+            return None
+
+    return None
+
+
+def is_year_only(value: str) -> bool:
+    """Whether the day and month in a parsed date were assumed rather than said.
+
+    Kept beside `as_date` so the two cannot disagree about what a bare year
+    looks like.
+    """
+    return bool(
+        isinstance(value, str) and _YEAR_ONLY.fullmatch(value.strip().translate(DIGIT_MAP))
+    )
 
 
 # -- The rules ---------------------------------------------------------------

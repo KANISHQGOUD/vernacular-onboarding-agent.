@@ -565,3 +565,47 @@ def test_an_impossible_value_is_re_asked_without_blaming_them():
 
     conversation.respond(session, "yes that is right")
     assert session.applicant["mobile"] == "9812345678"
+
+
+# ---------------------------------------------------------------------------
+# The clock. Read per turn, not once per process.
+# ---------------------------------------------------------------------------
+
+
+def test_the_date_is_read_at_the_turn_not_at_startup(monkeypatch):
+    """`create_app` builds one Conversation and shares it across every socket.
+
+    While `as_of` was `field(default_factory=date.today)` that factory ran once
+    -- at startup -- so a server up for a week aged every applicant against the
+    day it booted, and somebody who turned 18 on Wednesday was still 17 on
+    Friday. eligibility.py takes an explicit `as_of` precisely so a decision
+    does not depend on a clock; this was the caller freezing the clock instead
+    of supplying the date the conversation is happening on.
+    """
+    import app.conversation as module
+
+    # Built the way `create_app` builds it: no date supplied.
+    conversation = Conversation(
+        actions=build()[0].actions, classifier=FakeReader(), phraser=Phraser(client=None)
+    )
+    assert conversation.as_of is None, "a date captured at construction is a frozen clock"
+
+    days = iter([date(2026, 9, 2), date(2026, 9, 3)])
+
+    class MovingDate(date):
+        @classmethod
+        def today(cls):
+            return next(days)
+
+    monkeypatch.setattr(module, "date", MovingDate)
+
+    assert conversation.today() == date(2026, 9, 2)
+    assert conversation.today() == date(2026, 9, 3)
+
+
+def test_a_fixed_date_still_pins_the_turn():
+    """Tests and replays need the clock to stop. Passing one keeps it stopped."""
+    conversation, _, _ = build()
+    conversation.as_of = date(2020, 5, 17)
+    assert conversation.today() == date(2020, 5, 17)
+    assert conversation.today() == date(2020, 5, 17)

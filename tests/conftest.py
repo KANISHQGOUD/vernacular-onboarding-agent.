@@ -91,5 +91,5 @@ def save_field(actions, session, field_name: str, value: str, *, as_of=AS_OF):
     """
     actions.save_applicant_field(session, field_name, value, as_of=as_of)
     if session.pending_field is not None:
-        actions.confirm_pending_field(session)
+        actions.confirm_pending_field(session, as_of=as_of)
     return session
