@@ -12,6 +12,8 @@ from datetime import date
 from app.audit import InMemoryAuditSink
 from app.conversation import (
     DECLINE_TEXT,
+    SUGGESTED_DEPOSIT_PAISE,
+    SUGGESTED_PAYMENT_PAISE,
     FIELD_LABELS,
     FIELD_ORDER,
     REQUIRED_ACTION,
@@ -82,6 +84,14 @@ FULL_JOURNEY = (
     Classification(Event.DATA_PROVIDED, "occupation", "tailor"),
     # No mobile turn: `check_eligibility` writes it from the pre-screen answer
     # before COLLECT_DATA is reached, so it is never asked for here.
+    #
+    # The activation half. These two turns are the point of the product: an
+    # applicant who reaches an open account and stops is the dormant account
+    # the whole design exists to prevent, so the machine must not take them
+    # for the caller. Before these existed the journey ended at COMPLETED
+    # with no money turn in it at all.
+    Classification(Event.DEPOSIT_REQUESTED),
+    Classification(Event.PAYMENT_REQUESTED),
 )
 
 
@@ -105,9 +115,20 @@ def test_the_states_that_wait_for_a_person_are_the_expected_ones():
 
     Pinned so that adding an automatic action to a state where somebody is
     supposed to be asked something is a test failure, not a silent change.
+
+    FUNDING and FIRST_TRANSACTION are on this list on purpose. They used to
+    have automatic actions, so the machine deposited and paid the moment an
+    account existed and the caller never had a turn in the half of the flow
+    the product is actually measured on.
     """
     waiting = {s for s in State if s not in REQUIRED_ACTION and s not in TERMINAL_STATES}
-    assert waiting == {State.LANGUAGE_SELECT, State.CONSENT, State.COLLECT_DATA}
+    assert waiting == {
+        State.LANGUAGE_SELECT,
+        State.CONSENT,
+        State.COLLECT_DATA,
+        State.FUNDING,
+        State.FIRST_TRANSACTION,
+    }
 
 
 def test_field_order_covers_exactly_what_is_required():
@@ -338,7 +359,10 @@ def test_a_suspended_session_resumes_from_storage():
 
     reply = conversation.resume(loaded)
 
-    assert loaded.state is State.COMPLETED
+    # As far as the machine can go alone: the account exists, and the two
+    # money turns are the caller's to take.
+    assert loaded.state is State.FUNDING
+    assert loaded.account_number
     assert reply.moved is True
     assert reply.text.strip()
 
@@ -374,7 +398,15 @@ def test_a_decline_is_explained_from_the_rule_not_invented():
 
 
 def test_the_account_number_is_spoken_exactly():
-    conversation, session, _ = build(*FULL_JOURNEY, kyc_outcomes=[(KycStatus.PENDING, None)])
+    # Two more readings than FULL_JOURNEY has turns: the money intents in it
+    # are spent while the session is suspended at KYC, so the turns taken
+    # after the resume need their own.
+    conversation, session, _ = build(
+        *FULL_JOURNEY,
+        Classification(Event.DEPOSIT_REQUESTED),
+        Classification(Event.PAYMENT_REQUESTED),
+        kyc_outcomes=[(KycStatus.PENDING, None)],
+    )
     conversation.open(session)
     for _ in FULL_JOURNEY:
         conversation.respond(session, "x")
@@ -384,6 +416,14 @@ def test_the_account_number_is_spoken_exactly():
 
     conversation.resume(session)
     assert session.account_number
+
+    # Resuming opens the account and then STOPS, because the money turns
+    # belong to the caller. A resume that ran to COMPLETED would be the
+    # machine finishing somebody's application while they were away.
+    assert session.state is State.FUNDING
+
+    conversation.respond(session, "haan")
+    conversation.respond(session, "haan")
     assert session.state is State.COMPLETED
 
 
@@ -609,3 +649,118 @@ def test_a_fixed_date_still_pins_the_turn():
     conversation.as_of = date(2020, 5, 17)
     assert conversation.today() == date(2020, 5, 17)
     assert conversation.today() == date(2020, 5, 17)
+
+
+# ---------------------------------------------------------------------------
+# The activation half. The caller's money, moved when the caller says so.
+# ---------------------------------------------------------------------------
+
+DATA_TURNS = FULL_JOURNEY[:-2]     # everything up to the two money intents
+
+
+def _at_funding(*money):
+    """Drive a qualifying applicant to FUNDING, then take the turns given."""
+    script = DATA_TURNS + money
+    conversation, session, audit = build(*script)
+    conversation.as_of = date(2026, 9, 2)
+    conversation.open(session)
+    replies = [conversation.respond(session, "spoken") for _ in script]
+    return conversation, session, audit, replies
+
+
+def test_the_machine_stops_at_funding_and_waits():
+    """The single biggest thing this product got wrong.
+
+    FUNDING and FIRST_TRANSACTION used to be in REQUIRED_ACTION, so the moment
+    an account existed the machine deposited and paid and landed in COMPLETED
+    -- in the same turn, with no caller involvement at all.
+    """
+    _, session, _, replies = _at_funding()
+
+    assert session.state is State.FUNDING
+    assert session.account_number
+    assert session.deposit_reference is None, "money moved without being asked for"
+    assert session.first_payment_reference is None
+
+
+def test_the_caller_is_told_their_account_is_open():
+    """ANNOUNCE_ACCOUNT_OPENED was written, correct, and never spoken."""
+    _, session, _, replies = _at_funding()
+    assert session.account_number in replies[-1].text
+
+
+def test_saying_yes_uses_the_suggested_amounts():
+    """A one-word answer has to be enough. This product is for people who find
+    form questions hard, so "shall we start with Rs 500" beats "how much?"."""
+    _, session, _, _ = _at_funding(
+        Classification(Event.DEPOSIT_REQUESTED), Classification(Event.PAYMENT_REQUESTED)
+    )
+    assert session.state is State.COMPLETED
+    assert session.deposit_paise == SUGGESTED_DEPOSIT_PAISE
+    assert session.first_payment_paise == SUGGESTED_PAYMENT_PAISE
+
+
+def test_an_amount_they_name_wins_over_the_suggestion():
+    """It is a suggestion, not a default."""
+    _, session, _, _ = _at_funding(
+        Classification(Event.DEPOSIT_REQUESTED, value="2000"),
+        Classification(Event.PAYMENT_REQUESTED, value="50"),
+    )
+    assert session.state is State.COMPLETED
+    assert session.deposit_paise == 200_000
+    assert session.first_payment_paise == 5_000
+
+
+def test_an_amount_spoken_in_devanagari_is_the_same_amount():
+    _, session, _, _ = _at_funding(
+        Classification(Event.DEPOSIT_REQUESTED, value="१०००"),
+        Classification(Event.PAYMENT_REQUESTED, value="७५"),
+    )
+    assert session.deposit_paise == 100_000
+    assert session.first_payment_paise == 7_500
+
+
+def test_the_confirmation_says_what_was_actually_paid():
+    """It used to read a constant, which was right only by coincidence."""
+    _, session, _, replies = _at_funding(
+        Classification(Event.DEPOSIT_REQUESTED),
+        Classification(Event.PAYMENT_REQUESTED, value="50"),
+    )
+    assert "50.00" in replies[-1].text
+
+
+def test_stopping_after_the_account_opens_is_a_dormant_account():
+    """The exit this product exists to prevent, and it has to be reachable
+    before it can be counted. While the machine paid on the caller's behalf,
+    `funnel.dormant` was structurally zero for every real session."""
+    _, session, _, _ = _at_funding(Classification(Event.USER_QUIT))
+
+    assert session.state is State.ABANDONED
+    assert session.account_number, "an account was opened"
+    assert session.first_payment_reference is None, "and never used"
+
+
+def test_an_amount_over_our_ceiling_is_explained_not_swallowed():
+    """Our policy, not the rail's -- so the caller is told the limit and can
+    try again, rather than being asked the same question a second time."""
+    _, session, _, replies = _at_funding(
+        Classification(Event.DEPOSIT_REQUESTED),
+        Classification(Event.PAYMENT_REQUESTED, value="100000"),
+        Classification(Event.PAYMENT_REQUESTED, value="50"),
+    )
+    refusal = replies[-2].text
+    assert "500.00" in refusal, "the limit is not stated in rupees"
+    assert "paise" not in refusal, "a ledger unit leaked into speech"
+    assert session.state is State.COMPLETED, "they could not recover"
+
+
+def test_a_deposit_the_rail_refuses_asks_again_rather_than_congratulating():
+    """A failed deposit leaves the session in FUNDING, and re-announcing the
+    account there would answer a failure with congratulations."""
+    from app.llm.speech_acts import SpeechActKind
+
+    conversation, session, _, _ = _at_funding()
+    session.notes["deposit_failure"] = "insufficient funds at source"
+
+    act = conversation._speech_for(session)
+    assert act.kind is SpeechActKind.ASK_FOR_DEPOSIT

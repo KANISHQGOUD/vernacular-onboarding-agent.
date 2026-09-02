@@ -386,7 +386,7 @@ def test_a_date_in_devanagari_digits_is_the_same_date():
     did not -- so a date transcribed in Hindi numerals was rejected as "not a
     date" by the one product that should expect them most.
 
-    The separatorless form is the one that pins the FOLD. Python's `\d` and
+    The separatorless form is the one that pins the FOLD. Python's regex digit class and
     `int()` are both Unicode-aware, so the dashed form is rescued by the loose
     pattern below even with no fold at all -- which a first version of this
     test did not distinguish, and passed against the unfixed code.

@@ -120,6 +120,12 @@ class Event(StrEnum):
     CONSENT_REFUSED = "CONSENT_REFUSED"
     DATA_PROVIDED = "DATA_PROVIDED"
     USER_WANTS_HUMAN = "USER_WANTS_HUMAN"
+    # The activation half. Intents, because each is a reading of what the
+    # caller wants done with their own money -- and nothing has moved until
+    # the payment rail says so, which is what DEPOSIT_CONFIRMED and
+    # PAYMENT_CONFIRMED are for.
+    DEPOSIT_REQUESTED = "DEPOSIT_REQUESTED"
+    PAYMENT_REQUESTED = "PAYMENT_REQUESTED"
     # Answers to "I have written down X -- is that right?". Intents, because
     # they are readings of what the caller meant; a model may emit them, and
     # nothing about the world changes until one is acted on.
@@ -361,6 +367,20 @@ TRANSITIONS: dict[tuple[State, Event], tuple[Transition, ...]] = {
     # This state and the next are why the map does not end at ACCOUNT_CREATE.
     # An open, empty, untouched account IS the problem this product exists to
     # solve, so the graph refuses to call that finished.
+    # The caller asking for their own money to move. Self-loops, because
+    # asking is not the same as it having happened: the state changes when the
+    # RAIL confirms, via the fact rows just below. Without these two the
+    # activation half of the flow had no user intents at all, and the machine
+    # deposited and paid on the applicant's behalf the instant an account
+    # existed -- which made `funnel.dormant`, the number this whole design
+    # exists to move, structurally zero.
+    (State.FUNDING, Event.DEPOSIT_REQUESTED): (
+        Transition(State.FUNDING, why="They asked to put money in; the rail has not answered yet."),
+    ),
+    (State.FIRST_TRANSACTION, Event.PAYMENT_REQUESTED): (
+        Transition(State.FIRST_TRANSACTION, why="They asked to send it; the rail has not answered yet."),
+    ),
+
     (State.FUNDING, Event.DEPOSIT_CONFIRMED): (
         Transition(State.FIRST_TRANSACTION, why="Money is in. Now it has to actually get used."),
     ),

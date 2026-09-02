@@ -56,6 +56,7 @@ from app.providers.core_banking import CoreBankingProvider
 from app.providers.kyc import KycProvider, KycStatus
 from app.providers.payments import (
     FIRST_TRANSACTION_CEILING_PAISE,
+    format_rupees,
     PaymentRail,
     PaymentResult,
 )
@@ -472,6 +473,7 @@ class Actions:
             return session
 
         session.deposit_reference = result.reference
+        session.deposit_paise = amount_paise
         return self.machine.fire(session, Event.DEPOSIT_CONFIRMED)
 
     def make_first_payment(self, session: Session, to_vpa: str, amount_paise: int) -> Session:
@@ -488,8 +490,13 @@ class Actions:
             raise ActionRefused("no account to pay from")
 
         if amount_paise > FIRST_TRANSACTION_CEILING_PAISE:
+            # Rupees, not paise. This string is repeated to the caller by
+            # `_amount_refused_reply`, and paise is a unit for the ledger --
+            # telling somebody their payment is "capped at 50000 paise" is
+            # the machine's internals leaking into a conversation.
             raise ActionRefused(
-                f"first transaction is capped at {FIRST_TRANSACTION_CEILING_PAISE} paise"
+                "a first payment is capped at "
+                f"{format_rupees(FIRST_TRANSACTION_CEILING_PAISE)}"
             )
 
         result: PaymentResult = self.payments.send_payment(
@@ -501,4 +508,5 @@ class Actions:
             return session
 
         session.first_payment_reference = result.reference
+        session.first_payment_paise = amount_paise
         return self.machine.fire(session, Event.PAYMENT_CONFIRMED)

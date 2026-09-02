@@ -24,6 +24,11 @@ for a human to read or hear.
 
 from __future__ import annotations
 
+import re
+from decimal import Decimal
+
+from app.speech.wer import DIGIT_MAP
+
 import hashlib
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -64,6 +69,45 @@ class PaymentResult:
     @property
     def succeeded(self) -> bool:
         return self.status is PaymentStatus.SUCCESS
+
+
+# A number in the middle of a sentence: "500", "Rs 500", "500 rupees",
+# "1,000", "12.50". The decimal part is capped at two digits because paise
+# stop there; a third would be the recogniser inventing precision.
+_AMOUNT = re.compile(r"(\d+(?:\.\d{1,2})?)")
+
+
+def paise_from_text(text: str) -> int | None:
+    """A spoken rupee amount as integer paise, or None if there is no number.
+
+    Money is integer paise everywhere in this system, and this is the seam
+    where a sentence becomes one -- so it is the one place that has to resist
+    floats. `Decimal` rather than `float(...) * 100`, because 12.55 is not
+    representable in binary and `int(12.55 * 100)` is 1254.
+
+    Devanagari and the other Indic digits need no folding here, which is
+    worth stating because the obvious defensive `translate(DIGIT_MAP)` looks
+    load-bearing and is not: Python's `\\d` and `Decimal` both accept any
+    Unicode decimal digit, so `१०००` parses as a thousand unaided. Mutation
+    testing is what established that -- removing a fold changed no behaviour
+    at all. `fields.as_date` genuinely does need one, because
+    `date.fromisoformat` is stricter than `Decimal`.
+
+    Thousands separators are stripped before the decimal point is read, so
+    "1,000" is a thousand rupees rather than one rupee.
+    """
+    if not isinstance(text, str):
+        return None
+
+    folded = text.replace(",", "")
+    found = _AMOUNT.search(folded)
+    if not found:
+        return None
+
+    rupees = Decimal(found[1])
+    if rupees <= 0:
+        return None
+    return int(rupees * PAISE_PER_RUPEE)
 
 
 def format_rupees(amount_paise: int) -> str:

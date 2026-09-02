@@ -52,7 +52,7 @@ from app.llm.classifier import Classification, GeminiIntentClassifier
 from app.llm.client import ModelUnavailableError
 from app.llm.phrasing import Phraser
 from app.llm.speech_acts import SpeechAct, SpeechActKind
-from app.providers.payments import format_rupees
+from app.providers.payments import format_rupees, paise_from_text
 from app.session import Session
 
 log = logging.getLogger(__name__)
@@ -92,9 +92,20 @@ DECLINE_TEXT: Mapping[DeclineReason, str] = {
     ),
 }
 
-# Amounts the demo uses. In a real deployment these come from the caller.
-DEMO_DEPOSIT_PAISE = 50_000
-DEMO_PAYMENT_PAISE = 12_550
+# What we OFFER when the caller says yes without naming a figure. A
+# suggestion, not a default: any number they do say wins.
+#
+# Suggested rather than asked open-endedly, deliberately. "How much would you
+# like to deposit?" is a form question, and this product exists for people who
+# find form questions hard; "shall we start with Rs 500?" can be answered with
+# one word and still overridden by anybody who wants to.
+SUGGESTED_DEPOSIT_PAISE = 50_000
+SUGGESTED_PAYMENT_PAISE = 12_550
+
+# The payee stays a placeholder because the payment rail is mocked -- there is
+# no VPA directory to look a real shop up in. The AMOUNT is the caller's,
+# which is the half that makes this a transaction they made rather than one
+# made for them.
 DEMO_PAYEE = "kirana@upi"
 
 
@@ -224,7 +235,16 @@ class Conversation:
             log.info("refused %s in %s", reading.intent, before)
             return self._reply(session, moved=False, understood=False)
 
-        rejected = self._record_after_moving(session, reading)
+        try:
+            rejected = self._record_after_moving(session, reading)
+        except ActionRefused as refused:
+            # Our own ceiling, not the rail's -- see make_first_payment. The
+            # caller asked for something we will not do, which is not a
+            # misunderstanding and not their mistake, so they are told what
+            # the limit was rather than simply asked again.
+            log.info("refused an amount in %s: %s", session.state, refused)
+            return self._amount_refused_reply(session, str(refused))
+
         if rejected is not None:
             return self._rejected_reply(session, rejected)
 
@@ -266,6 +286,23 @@ class Conversation:
         Returned rather than stored, because this class holds no per-turn
         state -- and a rejection is very much per-turn.
         """
+        if reading.intent is Event.DEPOSIT_REQUESTED and session.state is State.FUNDING:
+            self.actions.initiate_deposit(
+                session, paise_from_text(reading.value or "") or SUGGESTED_DEPOSIT_PAISE
+            )
+            return None
+
+        if (
+            reading.intent is Event.PAYMENT_REQUESTED
+            and session.state is State.FIRST_TRANSACTION
+        ):
+            self.actions.make_first_payment(
+                session,
+                DEMO_PAYEE,
+                paise_from_text(reading.value or "") or SUGGESTED_PAYMENT_PAISE,
+            )
+            return None
+
         if reading.carries_data and session.state is State.COLLECT_DATA:
             try:
                 self.actions.save_applicant_field(
@@ -413,6 +450,21 @@ class Conversation:
         self._advance(session)
         return self._reply(session, moved=True, understood=True)
 
+    def _amount_refused_reply(self, session: Session, problem: str) -> Reply:
+        """They named an amount we will not send. Say the limit, stay put."""
+        return Reply(
+            text=self.phraser.say(
+                SpeechAct(
+                    kind=SpeechActKind.FIELD_NOT_USABLE,
+                    language=session.language or DEFAULT_LANGUAGE,
+                    data={"field_label": "amount", "problem_text": problem},
+                )
+            ),
+            state=session.state,
+            moved=False,
+            understood=True,
+        )
+
     def _rejected_reply(self, session: Session, rejected: FieldRejected) -> Reply:
         """Ask again, saying what was wrong with the VALUE.
 
@@ -479,6 +531,12 @@ class Conversation:
 
     def _speech_for(self, session: Session) -> SpeechAct:
         kind = STATE_SPEECH.get(session.state, SpeechActKind.DID_NOT_UNDERSTAND)
+
+        # A deposit the rail refused leaves the session in FUNDING, and
+        # announcing the account a second time would be answering a failure
+        # with congratulations. Ask again instead.
+        if session.state is State.FUNDING and "deposit_failure" in session.notes:
+            kind = SpeechActKind.ASK_FOR_DEPOSIT
         language = session.language or DEFAULT_LANGUAGE
         return SpeechAct(kind=kind, language=language, data=self._data_for(session, kind))
 
@@ -497,7 +555,8 @@ class Conversation:
             return {"account_number": session.account_number}
 
         if kind is SpeechActKind.CONFIRM_COMPLETED:
-            return {"amount_text": format_rupees(DEMO_PAYMENT_PAISE)}
+            paid = session.first_payment_paise or SUGGESTED_PAYMENT_PAISE
+            return {"amount_text": format_rupees(paid)}
 
         return {}
 
@@ -534,11 +593,11 @@ class Conversation:
     def _open_account(self, session: Session) -> None:
         self.actions.open_account(session)
 
-    def _deposit(self, session: Session) -> None:
-        self.actions.initiate_deposit(session, DEMO_DEPOSIT_PAISE)
-
-    def _pay(self, session: Session) -> None:
-        self.actions.make_first_payment(session, DEMO_PAYEE, DEMO_PAYMENT_PAISE)
+    # `_deposit` and `_pay` used to live here, as REQUIRED_ACTION entries.
+    # They are gone rather than merely unreferenced: the money now moves from
+    # `_record_after_moving`, on the caller's own turn, with the caller's own
+    # amount -- and leaving behind two methods that quietly did it the old way
+    # would be leaving the loaded gun next to the fix.
 
 
 # ---------------------------------------------------------------------------
@@ -555,9 +614,24 @@ REQUIRED_ACTION: Mapping[State, Callable[[Conversation, Session], None]] = {
     State.KYC_HANDOFF: Conversation._dispatch_kyc,
     State.KYC_PENDING: Conversation._poll_kyc,
     State.ACCOUNT_CREATE: Conversation._open_account,
-    State.FUNDING: Conversation._deposit,
-    State.FIRST_TRANSACTION: Conversation._pay,
 }
+
+# FUNDING and FIRST_TRANSACTION are deliberately ABSENT.
+#
+# They used to be here, and that was the single biggest gap in the product.
+# `_advance` runs this table until the state stops changing, so the moment an
+# account existed the machine deposited and paid on the applicant's behalf and
+# landed in COMPLETED -- in the same turn, without the caller saying a word.
+#
+# Three things followed. `funnel.dormant` (opened minus completed) could never
+# be anything but zero, so the one number this design exists to move was
+# unmeasurable. The caller was never told their account had opened. And
+# ANNOUNCE_ACCOUNT_OPENED, ASK_FOR_DEPOSIT and GUIDE_FIRST_PAYMENT -- all
+# written, all warm, all correct -- were never spoken.
+#
+# A state absent from this table waits for a person. These two should wait:
+# the caller putting money in and sending it out IS the activation this whole
+# product is measured on, and doing it for them measured nothing.
 
 STATE_SPEECH: Mapping[State, SpeechActKind] = {
     State.START: SpeechActKind.ASK_LANGUAGE,

@@ -235,7 +235,15 @@ def test_injection_over_the_socket_moves_nothing():
 
 
 def test_reconnecting_picks_the_session_back_up():
-    client, _ = build_client(*FULL_JOURNEY, kyc_outcomes=[(KycStatus.PENDING, None)])
+    # Two more readings than FULL_JOURNEY has turns: the money intents in it
+    # are spent while the session is suspended at KYC, so the turns taken
+    # after the resume need their own.
+    client, _ = build_client(
+        *FULL_JOURNEY,
+        Classification(Event.DEPOSIT_REQUESTED),
+        Classification(Event.PAYMENT_REQUESTED),
+        kyc_outcomes=[(KycStatus.PENDING, None)],
+    )
     created = open_session(client)
 
     with client.websocket_connect(socket_url(created)) as socket:
@@ -250,8 +258,17 @@ def test_reconnecting_picks_the_session_back_up():
     with client.websocket_connect(socket_url(created)) as socket:
         resumed = socket.receive_json()
 
-    assert resumed["state"] == State.COMPLETED
-    assert resumed["finished"] is True
+        # Caught up to where a person is needed again -- not run to the end.
+        assert resumed["state"] == State.FUNDING
+        assert resumed["finished"] is False
+
+        socket.send_json({"utterance": "haan"})
+        socket.receive_json()
+        socket.send_json({"utterance": "haan"})
+        finished = socket.receive_json()
+
+    assert finished["state"] == State.COMPLETED
+    assert finished["finished"] is True
 
 
 def test_a_dropped_socket_loses_no_progress():

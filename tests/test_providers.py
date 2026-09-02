@@ -234,3 +234,41 @@ def test_the_mocks_satisfy_their_protocols():
     assert isinstance(MockKycProvider(), KycProvider)
     assert isinstance(MockCoreBanking(), CoreBankingProvider)
     assert isinstance(MockPaymentRail(), PaymentRail)
+
+
+# ---------------------------------------------------------------------------
+# A spoken amount becoming integer paise. The seam where money enters.
+# ---------------------------------------------------------------------------
+
+
+def test_a_spoken_amount_becomes_integer_paise():
+    from app.providers.payments import paise_from_text
+
+    assert paise_from_text("500") == 50_000
+    assert paise_from_text("Rs 500") == 50_000
+    assert paise_from_text("500 rupees") == 50_000
+    assert paise_from_text("१०००") == 100_000     # Devanagari 1000
+    assert paise_from_text("1,000") == 100_000            # separator, not a decimal
+
+
+def test_the_amount_parser_does_not_go_through_a_float():
+    """573 of the first 10,000 paise values round the wrong way through a
+    float. 1.13 is one of them: int(1.13 * 100) is 112, one paisa short,
+    silently, on the very seam where money enters the system."""
+    from app.providers.payments import paise_from_text
+
+    assert int(1.13 * 100) == 112, "the bug this avoids"
+    assert paise_from_text("1.13") == 113
+    assert paise_from_text("0.29") == 29
+    assert paise_from_text("12.55") == 1255
+
+
+def test_a_sentence_with_no_number_is_not_an_amount():
+    """"haan" is a yes, not a figure -- the caller agreed to the suggestion."""
+    from app.providers.payments import paise_from_text
+
+    assert paise_from_text("haan") is None
+    assert paise_from_text("") is None
+    assert paise_from_text("0") is None
+    assert paise_from_text(None) is None
+

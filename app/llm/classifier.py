@@ -71,6 +71,14 @@ INTENT_GLOSS: dict[Event, str] = {
         "They asked to switch to a different language, or said they cannot "
         "follow the language currently being used."
     ),
+    Event.DEPOSIT_REQUESTED: (
+        "They agreed to put some money into the new account, or named an "
+        "amount to put in -- yes, go ahead, five hundred, make it a thousand."
+    ),
+    Event.PAYMENT_REQUESTED: (
+        "They agreed to make the first small payment, or named an amount to "
+        "send -- yes, send it, pay fifty rupees."
+    ),
     Event.CONSENT_GIVEN: (
         "They agreed to go ahead and let their personal details be used -- "
         "yes, fine, go on, I agree."

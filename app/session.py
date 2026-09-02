@@ -143,6 +143,16 @@ class Session:
 
     # -- Erasure ------------------------------------------------------------
 
+    # What went in, and what went out. Both kept beside their references
+    # and treated the same way.
+    deposit_paise: int | None = None
+    # What the first payment actually was. Kept beside the reference and
+    # treated the same way -- transaction metadata rather than the person --
+    # so it survives erasure exactly as `first_payment_reference` does.
+    # Needed because the amount is now the caller's, so "that payment of X
+    # went through" cannot be read off a constant any more.
+    first_payment_paise: int | None = None
+
     def erase_personal_data(self) -> None:
         """Honour a deletion request without destroying the audit trail.
 
@@ -178,6 +188,8 @@ class Session:
                 self.eligibility_input.to_dict() if self.eligibility_input else None
             ),
             "eligibility": self.eligibility.to_dict() if self.eligibility else None,
+            "deposit_paise": self.deposit_paise,
+            "first_payment_paise": self.first_payment_paise,
             "kyc_attempts": self.kyc_attempts,
             "kyc_reference": self.kyc_reference,
             "account_number": self.account_number,
@@ -202,6 +214,8 @@ class Session:
                 if raw["eligibility_input"]
                 else None
             ),
+            deposit_paise=raw.get("deposit_paise"),
+            first_payment_paise=raw.get("first_payment_paise"),
             eligibility=(
                 EligibilityDecision.from_dict(raw["eligibility"]) if raw["eligibility"] else None
             ),
