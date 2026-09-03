@@ -43,7 +43,38 @@ dormant account this exists to prevent, and the state machine says so.
 - **Eligibility rules are pure and versioned** (`2026-08-13.v1`), evaluated
   without short-circuit, with an explicit `as_of` and never a clock, so
   decisions replay years later.
-- **Money is integer paise, never floats.**
+- **The rules are asked again once the real date of birth is known.**
+  ELIGIBILITY runs before COLLECT_DATA on pre-screen answers, and
+  `Conversation._screen` still supplies placeholders — so until
+  `Actions._rescreen_eligibility` existed, the age rule had never once seen a
+  date a caller actually gave, and a 17-year-old who repeated theirs three
+  times was onboarded. The engine could always decline a minor; it was never
+  shown one.
+
+  The three-attempt escape in `save_applicant_field` is *not* the bug and was
+  left alone. **Recognition rules give up; law does not.** fields.py is about
+  whether we could have heard that, and is rightly generous; eligibility is
+  about whether it is allowed, and is not. Keeping those separate is what lets
+  the escape hatch stay wide without becoming a way through the age gate.
+- **The clock is read at the turn, not at startup.** `Conversation.as_of` is
+  `None` by default and `today()` reads the date per turn. It was
+  `field(default_factory=date.today)`, which runs once — and `create_app`
+  builds one Conversation and shares it across every socket, so a server up
+  for a week aged every applicant against the day it booted.
+- **Money is integer paise, never floats.** `paise_from_text` is the seam
+  where a spoken sentence becomes an amount, and it goes through `Decimal`:
+  573 of the first 10,000 paise values round the wrong way through a float,
+  and `int(1.13 * 100)` is 112.
+- **The caller makes their own first transaction.** FUNDING and
+  FIRST_TRANSACTION are *absent* from `REQUIRED_ACTION`, which is what makes
+  a state conversational, and they must stay absent. They were entries once,
+  so `_advance` deposited and paid the instant an account existed and landed
+  in COMPLETED in the same turn, with no caller involvement at all. That made
+  `funnel.dormant` — opened minus completed, the one number this design
+  exists to move — structurally zero for every real session, and it only ever
+  looked right against the synthetic journeys in the funnel tests.
+  `test_the_states_that_wait_for_a_person_are_the_expected_ones` pins the set
+  at five.
 - **`session.applicant` is regulated PII; `session.notes` is operational
   metadata.** Split so `erase_personal_data()` deletes the person and keeps
   the trail.
@@ -132,23 +163,34 @@ and spends one request from a 20/day quota.
 
 ## Current state
 
-Branch `master`, 42 commits, tree clean.
+Branch `master`, tree clean.
 
-**1055 tests pass, ~6s.** 1033 need no network and no keys; 22 need Postgres.
+> The commit count used to sit here and was wrong three times running. A
+> number written into a tracked file is stale the instant the commit that
+> writes it lands, so it cannot ever be right — it is gone rather than
+> re-synced. `git rev-list --count HEAD` answers it for free. The counts
+> below are not like that: they are wrong only when the code changes, which
+> is what makes them worth writing down.
+
+**1120 tests pass, ~10s.** 1098 need no network and no keys; 22 need Postgres.
 One more is skipped by default: the live Sarvam round trip, which runs only
 under `SARVAM_LIVE=1` because it spends prepaid credit.
 
 | | count |
 |---|---|
-| states / events / tools | 15 / 19 / 10 |
-| transition rows / terminal states | 49 / 5 |
+| states / events / tools | 15 / 21 / 10 |
+| transition rows / terminal states | 53 / 5 |
 | speech acts / audit kinds / languages | 19 / 10 / 11 |
 
 Terminal states: `COMPLETED`, `DECLINED`, `CONSENT_REFUSED`, `ABANDONED`,
 `HUMAN_HANDOFF`. Each is a different reason, because a funnel is only readable
 if the exits are distinguishable.
 
-Working end to end, verified live in a browser in Hindi:
+Working end to end. The browser-in-Hindi verification was done in an
+earlier session **with a Gemini key present**; there is none in this
+environment now, so a server started today runs `OfflineClassifier` and
+understands nothing. Everything below is exercised by the suite against fakes;
+the classifier is the one layer whose live behaviour that cannot prove.
 
 - State machine, eligibility, mocked providers (KYC, core banking, payments)
 - Gemini classifier — intent and extraction folded into one constrained call
@@ -390,6 +432,17 @@ whole design exists to move.
   so uvicorn's 16 MB default is the real backstop. The cap in `server.py`
   bounds the Sarvam bill, which is the half that costs actual money. Fine on
   a laptop, wrong for anything reachable.
+- **The two activation intents have never met the live model.**
+  `DEPOSIT_REQUESTED` and `PAYMENT_REQUESTED` are offered at FUNDING and
+  FIRST_TRANSACTION and their glosses reach the prompt — both checked — but
+  whether Gemini reads "haan, paanch sau" as one of them is untested, because
+  there is no key here. Two requests would settle it.
+- **The pre-screen is still literals.** `Conversation._screen` passes
+  `date(1990, 1, 1)`, `has_pan=True` and the rest as constants, so nobody is
+  ever declined *before* collection and the pre-screen costs a caller nothing
+  to pass. The re-screen above closes the hole that mattered; a real spoken
+  pre-screen is still missing, and until it exists ELIGIBILITY is a state the
+  flow passes through rather than a gate.
 - **Caller utterances and account numbers go to Google.** Fine for a portfolio
   project; a real deployment needs a DPA and probably in-region hosting.
 - **Erasure is SQL-level, not disk-level.** Measured with pageinspect: after
