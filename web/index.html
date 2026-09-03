@@ -1,0 +1,1187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vernacular onboarding agent</title>
+<style>
+  :root {
+    --bg: #12100e; --panel: #1b1815; --line: #2f2a25;
+    --text: #ece7e0; --dim: #8f867c; --accent: #d98a4f; --ok: #6f9f5c;
+    --font: ui-sans-serif, system-ui, "Segoe UI", "Noto Sans Devanagari", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--font); height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--dim); font-size: 13px; }
+  #status { margin-left: auto; font-size: 12px; color: var(--dim); }
+  #status.live::before { content: "● "; color: var(--ok); }
+  #status.dead::before { content: "● "; color: var(--accent); }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr 300px; min-height: 0; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } #side { display: none; } }
+
+  #chat { overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 62ch; line-height: 1.55; }
+  .msg .who { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); margin-bottom: 4px; }
+  .msg.you { align-self: flex-end; text-align: right; }
+  .msg.you .body { background: #2a2420; padding: 9px 13px; border-radius: 12px 12px 2px 12px; display: inline-block; }
+  .msg.agent .body { background: var(--panel); padding: 9px 13px; border-radius: 12px 12px 12px 2px; display: inline-block; border: 1px solid var(--line); }
+  .msg.note { color: var(--dim); font-size: 12px; font-style: italic; align-self: center; }
+  .meta { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  .meta .moved { color: var(--ok); }
+  .meta .stuck { color: var(--accent); }
+
+  #side { border-left: 1px solid var(--line); padding: 18px; overflow-y: auto; }
+  #side h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); margin: 0 0 10px; }
+  #state { font-size: 14px; margin-bottom: 20px; word-break: break-word; }
+  #trail { list-style: none; margin: 0; padding: 0; font-size: 12px; color: var(--dim); }
+  #trail li { padding: 3px 0; border-left: 2px solid var(--line); padding-left: 10px; }
+  #trail li.now { color: var(--text); border-left-color: var(--accent); }
+
+  footer { border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 10px; }
+  input {
+    flex: 1; background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    padding: 11px 14px; border-radius: 8px; font: inherit; font-size: 14px;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent); border: 0; color: #1a1410; font: inherit; font-weight: 600;
+    padding: 0 20px; border-radius: 8px; cursor: pointer;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.listening { background: #b3261e; color: #fff; border-color: #b3261e; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
+  button.listening { animation: pulse 1.1s ease-in-out infinite; }
+  label.toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; opacity: .8; }
+  #meter { width: 90px; height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+  #level { height: 100%; width: 0%; background: #9aa0a6; transition: width .05s linear; }
+  #meter.voice #level { background: #b3261e; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Vernacular onboarding agent</h1>
+  <span class="sub">speak any Indian language &middot; the state machine decides, the model only phrases</span>
+  <span id="status">connecting</span>
+</header>
+
+<main>
+  <div id="chat"></div>
+  <aside id="side">
+    <h2>Current state</h2>
+    <div id="state">&mdash;</div>
+    <h2>Path taken</h2>
+    <ol id="trail"></ol>
+  </aside>
+</main>
+
+<footer>
+  <input id="input" placeholder="Type what a caller would say…" autocomplete="off" maxlength="500" disabled>
+  <button id="send" disabled>Send</button>
+  <button id="mic" disabled title="Hold a conversation out loud">&#127908; Speak</button>
+  <label class="toggle"><input type="checkbox" id="tts" checked> speak replies</label>
+  <label class="toggle"><input type="checkbox" id="handsfree"> hands-free</label>
+  <label class="toggle" title="Opens a SECOND microphone stream for the level meter. Chrome's recogniser already has its own; on some machines the two conflict and the recogniser gets silence."><input type="checkbox" id="meterOn"> mic meter</label>
+  <div id="meter" title="microphone level; red means speech detected"><div id="level"></div></div>
+  <button id="retry" hidden>Reconnect</button>
+</footer>
+
+<script>
+const chat = document.getElementById("chat");
+const trail = document.getElementById("trail");
+const stateEl = document.getElementById("state");
+const statusEl = document.getElementById("status");
+const input = document.getElementById("input");
+const send = document.getElementById("send");
+const retry = document.getElementById("retry");
+const mic = document.getElementById("mic");
+const tts = document.getElementById("tts");
+const handsfree = document.getElementById("handsfree");
+const meterOn = document.getElementById("meterOn");
+const meter = document.getElementById("meter");
+const level = document.getElementById("level");
+
+let socket = null;
+let credentials = null;
+let attempts = 0;
+let needsNewSession = false;
+
+// Six tries over roughly half a minute is long enough to ride out a restart
+// and short enough that a genuinely dead server is reported rather than
+// silently retried forever.
+const MAX_ATTEMPTS = 6;
+const MAX_BACKOFF_MS = 10000;
+
+// ---------------------------------------------------------------------------
+// Speech, in the browser.
+//
+// The server never receives audio. The recogniser runs here, and what crosses
+// the socket is text plus how sure the recogniser was -- which is the one
+// thing a text-only channel throws away. Speech recognition does not fail
+// loudly: it returns a plausible sentence with no error, so "nahi" heard as
+// "haan" at the consent gate would look exactly like a consent. The number is
+// the only warning anyone gets, so it travels with the words.
+//
+// Free, no API key, and nothing to install. The trade is that it is Chrome,
+// Edge and Safari only, quality on Indic speech is whatever the browser
+// vendor's model manages, and the audio goes to their servers -- which is
+// fine for a demo and not something a bank could ship.
+// ---------------------------------------------------------------------------
+const Recogniser = window.SpeechRecognition || window.webkitSpeechRecognition;
+const canListen = Boolean(Recogniser);
+const canSpeak = "speechSynthesis" in window;
+
+let recognition = null;
+let listening = false;
+let player = null;   // the <audio> playing a server-synthesised reply
+let heardSoFar = "";
+let bestConfidence = null;
+let sawAnyResult = false;
+// Set by the server. When true the page records audio and sends it for
+// transcription instead of relying on Chrome's recogniser.
+let serverStt = false;
+let announcedMode = false;
+let announcedDevice = false;
+// The machine chooses the language and tells us. The browser never guesses it:
+// re-detecting per utterance would let one mumbled sentence switch somebody
+// into a language they cannot read.
+let language = "en-IN";
+
+function voiceFor(code) {
+  const voices = window.speechSynthesis.getVoices() || [];
+  return voices.find(v => v.lang === code)
+      || voices.find(v => v.lang && v.lang.replace("_", "-") === code)
+      || voices.find(v => v.lang && v.lang.split(/[-_]/)[0] === code.split("-")[0])
+      || null;
+}
+
+// A reply synthesised server-side, by a vendor with actual Indic voices.
+// Preferred over speechSynthesis whenever it arrives, because the browser
+// cannot do this at all: Windows ships no Indic voices, so the local path
+// reads Devanagari in an English one.
+//
+// Returns false if it could not play, and the caller then falls back. A
+// failure here must never leave the agent silent -- someone halfway through
+// opening a bank account is owed a reply even if it is in the wrong voice.
+function playFromServer(base64Wav) {
+  if (!tts.checked) return true;          // muted on purpose, not a failure
+  try {
+    const bytes = Uint8Array.from(atob(base64Wav), c => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+
+    stopSpeaking();
+    player = new Audio(url);
+    player.onended = () => URL.revokeObjectURL(url);
+    // Autoplay policies can refuse until the page has been clicked once.
+    // Falling back to the browser voice is better than silence.
+    player.play().catch(() => note("Click anywhere once to allow audio."));
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function stopSpeaking() {
+  if (player) { player.pause(); player = null; }
+  if (canSpeak) window.speechSynthesis.cancel();
+}
+
+function speak(text) {
+  if (!canSpeak || !tts.checked || !text) return;
+  // Never queue. If a new reply has arrived the previous one is stale, and a
+  // backlog of sentences talking over each other is how voice demos die.
+  window.speechSynthesis.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = language;
+  const voice = voiceFor(language);
+  if (voice) utterance.voice = voice;
+  else if (language !== "en-IN") {
+    note(`No installed voice for ${language} — reading it in the default voice. `
+       + `Start the server with SARVAM_TTS=1 for a real one.`);
+  }
+  window.speechSynthesis.speak(utterance);
+}
+
+function note(text) {
+  bubble("note", text);
+}
+
+// Why the recogniser might have heard nothing, asked of the browser rather
+// than guessed at.
+//
+// "Started, ended, no results, no error" is the least informative failure
+// this page can produce, and it has two completely different causes: the
+// microphone was never granted, or it was granted and the wrong device is
+// selected. The Permissions API separates them in one call, and knowing
+// which one it is turns a debugging session into a single click.
+//
+// An embedded or automation browser is the third case, and the one nobody
+// thinks to check: it reports permission "denied" and offers a device with
+// no label, because it cannot capture at all. The user agent names it.
+async function micTrouble() {
+  const embedded = / Claude\/|HeadlessChrome|Electron/.test(navigator.userAgent);
+
+  let state = "unknown";
+  try {
+    state = (await navigator.permissions.query({ name: "microphone" })).state;
+  } catch (err) {
+    state = "unavailable";
+  }
+
+  let devices = 0;
+  let named = 0;
+  try {
+    const all = await navigator.mediaDevices.enumerateDevices();
+    const ins = all.filter(d => d.kind === "audioinput");
+    devices = ins.length;
+    named = ins.filter(d => d.label).length;
+  } catch (err) {
+    /* enumeration is not essential; the permission state carries the answer */
+  }
+
+  if (embedded) {
+    return "This is an embedded browser, which cannot open a microphone at "
+         + "all — no setting will fix it. Open http://localhost:8000 in real "
+         + "Chrome, or use the text box, which does the same thing.";
+  }
+  if (state === "denied") {
+    return "Microphone permission is DENIED for this site. Click the padlock "
+         + "in the address bar, set Microphone to Allow, and reload.";
+  }
+  if (devices === 0) {
+    return "The browser reports no audio input devices at all — this is an "
+         + "operating-system or hardware problem, not a permission one.";
+  }
+  if (state === "granted" && named === 0) {
+    return "Permission is granted but no input device has a name, which "
+         + "usually means the selected microphone is disconnected.";
+  }
+  if (state === "granted") {
+    return "Permission is granted and a device is present, so the microphone "
+         + "is being read and is silent — check which input Chrome is using "
+         + "via the padlock, and that it is not muted in Windows.";
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Turn-taking.
+//
+// The detector lives here because this is where the microphone is. The
+// POLICY -- how long a pause ends a turn -- arrives from the server with each
+// reply, because it depends on the conversation's state and the page has no
+// business deciding that. See app/flow/turn_taking.py.
+//
+// Two jobs:
+//
+//   endpointing  decide they have finished, and stop the recogniser. Chrome
+//                will endpoint on its own, but on a fixed heuristic we cannot
+//                tune. Running the recogniser in continuous mode and stopping
+//                it ourselves is what makes a per-state window possible.
+//   barge-in     if they start talking while the agent is talking, stop the
+//                agent. A machine that finishes its sentence over somebody is
+//                the support line everyone has met.
+//
+// Energy-based, with an ambient floor measured at the start of each turn
+// rather than a constant. A constant threshold is wrong in both directions:
+// deaf in a noisy room, hair-trigger in a quiet one, and this is meant for
+// people who are not in offices.
+//
+// UNTUNED. These constants are reasonable, not measured -- verifying them
+// needs a real microphone in a real room, which is what the level meter is
+// for. Watch it while speaking: the bar should turn red only while you talk.
+// ---------------------------------------------------------------------------
+// MEASURED, not guessed. Real Hindi speech through this exact RMS maths
+// (scripts/measure_vad.py over the corpus clips) sits at about 0.26, with
+// between-word quiet four orders of magnitude below it. Every number here is
+// derived from that, and the script re-derives them if the corpus changes.
+const SPEECH_RMS = 0.26;       // measured median across 8 clips
+
+const CALIBRATION_MS = 400;    // how long to listen to the room first
+const ENTER_MARGIN = 3.5;      // times the floor to START counting speech
+const EXIT_MARGIN = 2.0;       // ...and to stop. Hysteresis; see below.
+const MIN_THRESHOLD = 0.006;   // ~2% of speech: a floor for very quiet rooms
+const MAX_THRESHOLD = SPEECH_RMS / 3;  // never calibrate ourselves deaf
+const MIN_SPEECH_MS = 200;     // shorter than this is a cough, not a turn
+const TICK_MS = 50;            // see the note on requestAnimationFrame below
+
+// Hysteresis, which matters more than the exact numbers. With one threshold,
+// a signal hovering near it flickers voiced/unvoiced every frame and chops a
+// sentence into fragments. Entering speech needs 3.5x the floor; staying in
+// it only needs 2.0x. That is the difference between "is this speech" and
+// "are they still talking", and they are not the same question.
+function isVoiced(rms, floor, alreadySpeaking) {
+  const threshold = floor * (alreadySpeaking ? EXIT_MARGIN : ENTER_MARGIN);
+  return rms > threshold;
+}
+
+// Pulled out of the animation loop so it can be exercised with made-up
+// numbers instead of a microphone. The loop measures; this decides, and the
+// deciding is the part with the bugs in it.
+//
+//   sawSpeech        have they said anything at all this turn
+//   speechStartedAt  when they began, for the too-short-to-count check
+//   lastVoiceAt      the last frame above the threshold
+//   silenceMs        the per-state window, from turn_taking.py
+//
+// Returns "listening", "endpoint" (they have finished) or "gave-up" (nobody
+// ever started). Separate answers because they need separate replies: one
+// sends a turn, the other says "I didn't catch anything".
+function turnVerdict({ sawSpeech, speechStartedAt, lastVoiceAt, startedAt, now, silenceMs, patienceMs, minSpeechMs }) {
+  // How long they actually spoke -- first voiced frame to LAST voiced frame.
+  // Measuring to `now` instead was a real bug: a 100ms cough followed by eight
+  // seconds of silence looked like eight seconds of speech, so the agent
+  // answered a chair scrape. In the rooms this product is for, that is not an
+  // edge case.
+  const speechDuration = sawSpeech ? lastVoiceAt - speechStartedAt : 0;
+  const enoughSpeech = speechDuration > minSpeechMs;
+  const quietFor = sawSpeech ? now - lastVoiceAt : now - startedAt;
+
+  if (enoughSpeech && quietFor > silenceMs) return "endpoint";
+
+  // Checked whether or not a noise was heard. Nesting this under `else` was
+  // the second half of the same bug: a cough set sawSpeech, and the detector
+  // then had no way to ever give up.
+  if (now - startedAt > patienceMs) return "gave-up";
+
+  return "listening";
+}
+
+// Re-runnable, because there is no JS test runner in this project and the
+// bug these caught was a real one: open the page with ?selftest=1 and read
+// the console. Cheaper than adding a toolchain for one pure function, and
+// honest about being a smaller promise than the Python suite.
+const TURN_CASES = [
+  ["nobody spoke, still patient",        { sawSpeech:false, now:5000 }, "listening"],
+  ["nobody spoke, patience spent",       { sawSpeech:false, now:12500 }, "gave-up"],
+  ["mid-sentence pause",                 { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:5200 }, "listening"],
+  ["just under the CONSENT window",      { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:5790 }, "listening"],
+  ["past the CONSENT window",            { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:5900 }, "endpoint"],
+  ["that pause ends LANGUAGE_SELECT",    { silenceMs:800, sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:4900 }, "endpoint"],
+  ["...but not CONSENT",                 { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:4000, now:4900 }, "listening"],
+  ["a cough is not a turn",              { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:1100, now:9000 }, "listening"],
+  ["a cough eventually gives up",        { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:1100, now:12500 }, "gave-up"],
+  ["a short yes still counts",           { sawSpeech:true, speechStartedAt:1000, lastVoiceAt:1350, now:3200 }, "endpoint"],
+];
+
+// Hysteresis: it takes more energy to START hearing speech than to keep
+// hearing it. With one threshold a signal hovering near it flickers every
+// frame and chops a sentence into fragments.
+const VOICED_CASES = [
+  ["clear speech starts",        [0.26,  0.005, false], true],
+  ["room tone does not",         [0.010, 0.005, false], false],
+  ["a quiet tail keeps going",   [0.013, 0.005, true],  true],
+  ["...but would not have started", [0.013, 0.005, false], false],
+  ["true silence ends it",          [0.008, 0.005, true],  false],
+];
+
+function runTurnSelfTest() {
+  const base = { startedAt: 0, minSpeechMs: 200, patienceMs: 12000, silenceMs: 1800 };
+  let failed = 0;
+  for (const [name, input, want] of TURN_CASES) {
+    const got = turnVerdict({ ...base, ...input });
+    if (got !== want) { failed++; console.error(`FAIL ${name}: wanted ${want}, got ${got}`); }
+    else console.log(`ok   ${name}`);
+  }
+  for (const [name, [rms, floor, speaking], want] of VOICED_CASES) {
+    const got = isVoiced(rms, floor, speaking);
+    if (got !== want) { failed++; console.error(`FAIL ${name}: wanted ${want}, got ${got}`); }
+    else console.log(`ok   ${name}`);
+  }
+  const total = TURN_CASES.length + VOICED_CASES.length;
+  console.log(failed ? `${failed} FAILED` : `all ${total} passed`);
+  return failed === 0;
+}
+
+if (new URLSearchParams(location.search).get("selftest") === "1") {
+  setTimeout(runTurnSelfTest, 0);
+}
+
+let detector = null;
+// What the microphone is actually doing. Readable from the console with
+// micDiag(), because "it is listening but nothing happens" is not a
+// debuggable report and this turns it into numbers.
+let micState = null;
+
+// The recogniser's own story, which the audio diagnostic could not tell.
+// Chrome's SpeechRecognition opens its OWN microphone, separate from the
+// stream the detector uses, so "the detector heard nothing" and "the
+// recogniser heard nothing" are different failures with different fixes.
+let recogState = {
+  started: 0, results: 0, interim: 0, finals: 0, ended: 0,
+  lastError: null, lastTranscript: "",
+};
+
+function micDiag() {
+  return {
+    audio: micState,
+    recogniser: recogState,
+    listening,
+    heardSoFar,
+    policy: turnPolicy,
+    // The two questions that separate every remaining cause.
+    audioWorking: Boolean(micState && micState.framesSeen > 0),
+    recogniserWorking: recogState.results > 0,
+  };
+}
+window.micDiag = micDiag;
+let turnPolicy = { silence_ms: 1000, patience_ms: 12000, barge_in: true, report_interruption: false };
+let interruptedThisTurn = false;
+
+function agentIsTalking() {
+  return Boolean(player && !player.paused) ||
+         (canSpeak && window.speechSynthesis.speaking);
+}
+
+// Reads a stream somebody else opened, so the recorder and the meter share
+// one capture. `startDetector` keeps its own getUserMedia for the Chrome path.
+function startMeterOn(stream, onSpeechEnd) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === "suspended") ctx.resume().catch(() => {});
+
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  ctx.createMediaStreamSource(stream).connect(analyser);
+
+  const frame = new Float32Array(analyser.fftSize);
+  const startedAt = performance.now();
+  const ambient = [];
+  let floor = MIN_THRESHOLD, speechStartedAt = 0, lastVoiceAt = 0, sawSpeech = false;
+
+  micState = {
+    context: ctx.state, sampleRate: ctx.sampleRate,
+    track: (stream.getAudioTracks()[0] || {}).label || "unknown",
+    peakRms: 0, floor: null, framesSeen: 0, voicedFrames: 0,
+  };
+
+  const timer = setInterval(() => {
+    analyser.getFloatTimeDomainData(frame);
+    let sum = 0;
+    for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+    const rms = Math.sqrt(sum / frame.length);
+    const now = performance.now();
+
+    if (now - startedAt < CALIBRATION_MS) { ambient.push(rms); return; }
+    if (ambient.length) {
+      const sorted = [...ambient].sort((a, b) => a - b);
+      floor = Math.min(Math.max(sorted[Math.floor(sorted.length * 0.2)] || 0, MIN_THRESHOLD), MAX_THRESHOLD);
+      ambient.length = 0;
+    }
+
+    const voice = isVoiced(rms, floor, sawSpeech && (now - lastVoiceAt) < 300);
+    micState.framesSeen++; micState.floor = floor;
+    if (rms > micState.peakRms) micState.peakRms = rms;
+    if (voice) micState.voicedFrames++;
+
+    level.style.width = Math.min(100, (rms / (floor * ENTER_MARGIN * 2)) * 100) + "%";
+    meter.classList.toggle("voice", voice);
+
+    if (voice) {
+      if (!sawSpeech) {
+        sawSpeech = true;
+        speechStartedAt = now;
+        if (agentIsTalking()) { interruptedThisTurn = true; stopSpeaking(); }
+      }
+      lastVoiceAt = now;
+    }
+
+    const verdict = turnVerdict({
+      sawSpeech, speechStartedAt, lastVoiceAt, startedAt, now,
+      silenceMs: turnPolicy.silence_ms,
+      patienceMs: turnPolicy.patience_ms,
+      minSpeechMs: MIN_SPEECH_MS,
+    });
+    if (verdict !== "listening") { stopMeter(); onSpeechEnd(); }
+  }, TICK_MS);
+
+  meterHandle = { stop() { clearInterval(timer); ctx.close().catch(() => {}); level.style.width = "0%"; meter.classList.remove("voice"); } };
+}
+
+let meterHandle = null;
+function stopMeter() { if (meterHandle) { meterHandle.stop(); meterHandle = null; } }
+
+async function startDetector({ onSpeechEnd, onGaveUp }) {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+  // An AudioContext created after an `await` is outside the user-gesture that
+  // started it, so Chrome may hand it back SUSPENDED -- and a suspended
+  // context's analyser returns silence forever. The detector then never hears
+  // anything, never endpoints, and the microphone sits lit while nothing
+  // happens. That is exactly the bug this line fixes, and it is invisible
+  // without asking: there is no error, just zeroes.
+  if (ctx.state === "suspended") {
+    try { await ctx.resume(); } catch (e) { /* reported below */ }
+  }
+
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  ctx.createMediaStreamSource(stream).connect(analyser);
+
+  micState = {
+    context: ctx.state,
+    sampleRate: ctx.sampleRate,
+    track: (stream.getAudioTracks()[0] || {}).label || "unknown",
+    peakRms: 0,
+    floor: null,
+    framesSeen: 0,
+    voicedFrames: 0,
+  };
+  if (ctx.state !== "running") {
+    note("Audio context is " + ctx.state + " — the level meter will stay flat.");
+  }
+
+  const frame = new Float32Array(analyser.fftSize);
+  const startedAt = performance.now();
+  const ambient = [];
+
+  let floor = MIN_THRESHOLD;
+  let speechStartedAt = 0;
+  let lastVoiceAt = 0;
+  let sawSpeech = false;
+  let raf = 0;
+
+  function tick() {
+    analyser.getFloatTimeDomainData(frame);
+    let sum = 0;
+    for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+    const rms = Math.sqrt(sum / frame.length);
+    const now = performance.now();
+
+    // Measure the room before judging anything in it.
+    if (now - startedAt < CALIBRATION_MS) {
+      ambient.push(rms);
+      return;
+    }
+    if (ambient.length) {
+      const sorted = [...ambient].sort((a, b) => a - b);
+      // 20th percentile, not the median. If somebody is already talking when
+      // the turn opens -- which happens constantly in hands-free, because
+      // people answer before the agent has finished -- the median of that
+      // window IS speech, and calibrating to it makes the detector deaf for
+      // the rest of the turn. A low percentile still finds the gaps.
+      floor = sorted[Math.floor(sorted.length * 0.2)] || 0;
+      floor = Math.min(Math.max(floor, MIN_THRESHOLD), MAX_THRESHOLD);
+      ambient.length = 0;
+    }
+
+    const voice = isVoiced(rms, floor, sawSpeech && (now - lastVoiceAt) < 300);
+
+    if (micState) {
+      micState.framesSeen++;
+      micState.floor = floor;
+      if (rms > micState.peakRms) micState.peakRms = rms;
+      if (voice) micState.voicedFrames++;
+    }
+    level.style.width = Math.min(100, (rms / (floor * ENTER_MARGIN * 2)) * 100) + "%";
+    meter.classList.toggle("voice", voice);
+
+    if (voice) {
+      if (!sawSpeech) {
+        sawSpeech = true;
+        speechStartedAt = now;
+        // Barge-in. They started; the agent stops.
+        if (agentIsTalking()) {
+          interruptedThisTurn = true;
+          stopSpeaking();
+        }
+      }
+      lastVoiceAt = now;
+    }
+
+    const verdict = turnVerdict({
+      sawSpeech, speechStartedAt, lastVoiceAt, startedAt, now,
+      silenceMs: turnPolicy.silence_ms,
+      patienceMs: turnPolicy.patience_ms,
+      minSpeechMs: MIN_SPEECH_MS,
+    });
+
+    if (verdict === "endpoint") { stopDetector(); onSpeechEnd(); return; }
+    if (verdict === "gave-up") { stopDetector(); onGaveUp(); return; }
+  }
+
+  // setInterval rather than requestAnimationFrame. rAF stops firing when the
+  // tab is hidden, so switching tabs mid-sentence froze the detector and the
+  // turn never ended. It also paces at the display's refresh rate, which is
+  // not a sampling decision anyone made -- 50ms is a choice, 16.7ms was an
+  // accident of the monitor.
+  detector = {
+    stop() {
+      clearInterval(raf);
+      stream.getTracks().forEach(t => t.stop());
+      ctx.close().catch(() => {});
+      level.style.width = "0%";
+      meter.classList.remove("voice");
+    },
+  };
+  raf = setInterval(tick, TICK_MS);
+}
+
+// The endpoint. Every result pushes it back; when results stop arriving for
+// the state's window, the turn is over. Cleared whenever the turn ends by any
+// route, so it cannot fire into a finished turn.
+let fallbackStop = null;
+
+function armFallbackStop(afterMs) {
+  clearTimeout(fallbackStop);
+  fallbackStop = setTimeout(() => {
+    if (!listening) return;
+    // If nothing was ever finalised, keep the last interim rather than
+    // sending nothing. Chrome discards interims on stop(), and an
+    // approximate transcript beats a lost turn -- the confidence gate
+    // downstream is what decides whether it is good enough to act on.
+    if (!heardSoFar.trim() && recogState.lastTranscript) {
+      heardSoFar = recogState.lastTranscript;
+    }
+    try { recognition.stop(); } catch (e) {}
+  }, afterMs !== undefined ? afterMs : turnPolicy.silence_ms);
+}
+
+function stopDetector() {
+  if (detector) { detector.stop(); detector = null; }
+}
+
+// ---------------------------------------------------------------------------
+// Recording, for when Chrome's recogniser cannot be used.
+//
+// Chrome's SpeechRecognition sends audio to Google's speech service, and when
+// that is unreachable it fails SILENTLY: no error, no results, a microphone
+// that is plainly working and a page that receives nothing. Observed on a real
+// machine, and undiagnosable from inside the page -- which is why this path
+// exists rather than more instrumentation.
+//
+// Here the browser only captures. Transcription happens on the server, with
+// the same vendor that already does synthesis, and one getUserMedia stream
+// feeds both the recorder and the level meter -- so nothing competes for the
+// microphone the way two recognisers did.
+// ---------------------------------------------------------------------------
+function pickMimeType() {
+  const wanted = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  for (const type of wanted) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return "";
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = reject;
+    // readAsDataURL gives "data:<type>;base64,<payload>"; the server wants
+    // only the payload.
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function recordTurn() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+
+  const track = stream.getAudioTracks()[0];
+  if (track && !announcedDevice) {
+    announcedDevice = true;
+    note("Recording from: " + (track.label || "default input"));
+  }
+
+  const mimeType = pickMimeType();
+  const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  const chunks = [];
+  let sent = false;
+
+  recorder.ondataavailable = (event) => {
+    if (event.data && event.data.size) chunks.push(event.data);
+  };
+
+  recorder.onstop = async () => {
+    stopMeter();
+    stream.getTracks().forEach((t) => t.stop());
+    listening = false;
+    mic.classList.remove("listening");
+    mic.innerHTML = "&#127908; Speak";
+
+    const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+    // Under about 1KB is a click or a cough, not a turn. Sending it costs
+    // money and returns nothing useful.
+    if (sent || blob.size < 1200) {
+      note("Didn't catch anything — say it again.");
+      return;
+    }
+    sent = true;
+
+    const payload = { audio: await blobToBase64(blob), audio_type: blob.type };
+    if (interruptedThisTurn && turnPolicy.report_interruption) payload.interrupted = true;
+    interruptedThisTurn = false;
+
+    bubble("you", "…", `sent ${(blob.size / 1024).toFixed(0)} KB for transcription`);
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+  };
+
+  // The same stream drives the meter and the endpoint decision. One capture,
+  // two readers, no competition.
+  startMeterOn(stream, () => {
+    if (recorder.state === "recording") recorder.stop();
+  });
+
+  listening = true;
+  mic.classList.add("listening");
+  mic.innerHTML = "&#9632; Listening…";
+  recorder.start();
+
+  // Hard stop, so a detector that never fires cannot listen forever.
+  setTimeout(() => {
+    if (recorder.state === "recording") recorder.stop();
+  }, turnPolicy.patience_ms);
+}
+
+function startListening() {
+  if (serverStt) {
+    recordTurn().catch((err) => {
+      listening = false;
+      mic.classList.remove("listening");
+      mic.innerHTML = "&#127908; Speak";
+      note("Microphone unavailable: " + err.name);
+    });
+    return;
+  }
+
+  if (!canListen || listening) return;
+
+  // Stop talking before listening, or the microphone hears the agent and
+  // transcribes the agent's own sentence back to the server.
+  stopSpeaking();
+
+  recognition = new Recogniser();
+  recognition.lang = language;
+  // Continuous, and WE decide when it ends. Chrome endpoints on a heuristic
+  // we cannot tune; a per-state window is the whole point of turn_taking.py.
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 1;
+
+  heardSoFar = "";
+  bestConfidence = null;
+  interruptedThisTurn = false;
+  sawAnyResult = false;
+  recogState = {
+    started: 0, results: 0, interim: 0, finals: 0, ended: 0,
+    lastError: null, lastTranscript: "",
+  };
+
+  // Endpointing runs off the RECOGNISER's results, not off a second
+  // microphone. Chrome's SpeechRecognition opens its own capture, and opening
+  // another with getUserMedia made two consumers compete for one device --
+  // on some machines the recogniser loses and receives silence, which looks
+  // from outside exactly like "the mic is listening and nothing happens".
+  //
+  // Results are the signal that is guaranteed to exist whenever recognition
+  // is working at all, so turn-taking is built on them. The per-state windows
+  // from turn_taking.py apply unchanged: what differs is only how "they are
+  // still talking" is observed.
+  //
+  // The Web Audio detector is now opt-in, for the level meter and for
+  // barge-in that reacts to sound the recogniser never transcribes. Useful,
+  // and not worth risking the whole conversation on.
+  if (meterOn.checked) {
+    startDetector({
+      onSpeechEnd: () => { try { recognition.stop(); } catch (e) {} },
+      onGaveUp: () => { try { recognition.stop(); } catch (e) {} },
+    }).catch(err => note("Level meter unavailable: " + err.name));
+  }
+
+  // Nobody speaks at all: end the turn rather than listening forever.
+  armFallbackStop(turnPolicy.patience_ms);
+
+  recognition.onstart = () => {
+    recogState.started++;
+    listening = true;
+    mic.classList.add("listening");
+    mic.innerHTML = "&#9632; Listening…";
+  };
+
+  recognition.onend = () => {
+    recogState.ended++;
+    listening = false;
+    clearTimeout(fallbackStop);
+    stopDetector();
+    mic.classList.remove("listening");
+    mic.innerHTML = "&#127908; Speak";
+
+    if (heardSoFar.trim()) {
+      sendUtterance(heardSoFar, bestConfidence);
+    } else {
+      note("Didn't catch anything — say it again.");
+
+      // Name which half failed. From the outside a suspended audio context, a
+      // recogniser that never got audio, and somebody sitting quietly all
+      // look identical, and that is how this went round twice.
+      //
+      // The FIRST question is whether there is an audio reading at all. The
+      // Web Audio detector above is opt-in, so with the meter unticked there
+      // is none -- and an earlier version of this block read that as a
+      // failure and announced "the audio context is not started. This is not
+      // you." every single time. Confidently, and wrongly: it is the normal
+      // state of a disabled feature, and it sent a debugging session chasing
+      // an AudioContext that was never meant to be running.
+      const audioAlive = micState && micState.framesSeen > 0;
+      const recogAlive = recogState.results > 0;
+
+      if (!meterOn.checked) {
+        note("The level meter is off, so there is no audio reading to show — "
+           + "that is expected, not a fault. Tick “mic meter” and say it "
+           + "again if you want one.");
+      } else if (!audioAlive) {
+        note("The level meter never read a frame — the audio context is "
+           + (micState ? micState.context : "not started") + ". This is not you.");
+      } else if (micState.voicedFrames === 0) {
+        note(
+          `Read ${micState.framesSeen} frames, none above the speech threshold `
+          + `(peak ${micState.peakRms.toFixed(4)} vs `
+          + `${(micState.floor * ENTER_MARGIN).toFixed(4)}). Either the mic is `
+          + `muted or the threshold is too high for this room.`
+        );
+      }
+
+      if (!recogAlive) {
+        // No error at all is a different failure from a named one, and the
+        // fix is different too: an error means Chrome refused, silence means
+        // Chrome listened to the wrong thing.
+        note(recogState.lastError
+          ? `Chrome's recogniser failed with “${recogState.lastError}”.`
+          : "Chrome's recogniser started and ended without a single result, "
+            + "and reported no error.");
+
+        // Asked of the browser rather than left to the reader. This is the
+        // line that actually names the fix.
+        micTrouble().then(reason => { if (reason) note(reason); });
+      }
+      note("Run micDiag() in the console and send me what it prints.");
+    }
+  };
+
+  recognition.onerror = (event) => {
+    recogState.lastError = event.error;
+    if (event.error === "no-speech") { note("Didn't hear anything."); return; }
+    if (event.error === "not-allowed") {
+      note("Microphone blocked. Allow it in the address bar to speak.");
+      mic.disabled = true;
+      return;
+    }
+    note("Microphone error: " + event.error);
+  };
+
+  // Accumulate finals; the turn is normally sent from onend, once OUR
+  // detector has decided it is over.
+  //
+  // BUT the detector must not be the only thing that can end a turn. It was,
+  // and a detector that heard nothing meant nothing was ever sent -- the mic
+  // stayed lit while the recogniser was working perfectly and its words went
+  // nowhere. One component failing should degrade the experience, not remove
+  // it, which is the same rule the synthesis path already follows.
+  //
+  // So every final result arms a fallback stop. Whichever endpoint arrives
+  // first wins; if the VAD is healthy it always will, because it is watching
+  // the audio rather than waiting on a recogniser that has already decided.
+  recognition.onresult = (event) => {
+    recogState.results++;
+
+    // Barge-in, from the recogniser. The audio detector does this sooner when
+    // it is on, but it must not be the ONLY way -- a person talking over the
+    // agent has to be able to stop it whether or not the meter is enabled.
+    if (!sawAnyResult) {
+      sawAnyResult = true;
+      if (agentIsTalking()) {
+        interruptedThisTurn = true;
+        stopSpeaking();
+      }
+    }
+
+    // Armed on ANY result, interim included. This was finals-only, and with
+    // continuous=true Chrome frequently emits nothing final until stop() is
+    // called -- so the timer that was supposed to be the safety net never
+    // armed, and the VAD stayed the only thing that could end a turn. A
+    // safety net that depends on the thing it is protecting against is not
+    // one.
+    armFallbackStop();
+
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      if (!result.isFinal) {
+        recogState.interim++;
+        recogState.lastTranscript = result[0].transcript;
+        continue;
+      }
+      recogState.finals++;
+      const best = result[0];
+      heardSoFar += (heardSoFar ? " " : "") + best.transcript;
+      // Chrome reports 0 for some results rather than omitting the field. A
+      // real zero and "not measured" are different things, and sending 0
+      // would block every turn, so an absent or zero score travels as null.
+      const raw = best.confidence;
+      if (typeof raw === "number" && raw > 0) {
+        bestConfidence = bestConfidence === null ? raw : Math.min(bestConfidence, raw);
+      }
+      armFallbackStop();
+    }
+  };
+
+  recognition.start();
+}
+
+function bubble(who, text, meta) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + who;
+  if (who !== "note") {
+    const label = document.createElement("div");
+    label.className = "who";
+    label.textContent = who === "you" ? "caller" : "agent";
+    wrap.appendChild(label);
+  }
+  const body = document.createElement("div");
+  body.className = who === "note" ? "" : "body";
+  body.textContent = text;
+  wrap.appendChild(body);
+  if (meta) {
+    const m = document.createElement("div");
+    m.className = "meta";
+    m.innerHTML = meta;
+    wrap.appendChild(m);
+  }
+  chat.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function recordState(state, moved) {
+  stateEl.textContent = state;
+  const previous = trail.lastElementChild;
+  if (previous) previous.classList.remove("now");
+  if (!previous || previous.dataset.state !== state) {
+    const li = document.createElement("li");
+    li.textContent = state;
+    li.dataset.state = state;
+    li.className = "now";
+    trail.appendChild(li);
+  } else {
+    previous.classList.add("now");
+  }
+}
+
+function setLive(live, label) {
+  statusEl.className = live ? "live" : "dead";
+  statusEl.textContent = label;
+  input.disabled = !live;
+  send.disabled = !live;
+  mic.disabled = !live || !canListen;
+  if (!live) stopSpeaking();
+  if (live) input.focus();
+}
+
+async function start() {
+  const created = await fetch("/api/session", { method: "POST" }).then(r => r.json());
+  credentials = created;
+  connect();
+}
+
+function connect() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${scheme}://${location.host}/ws`
+    + `?session=${encodeURIComponent(credentials.session_id)}`
+    + `&token=${encodeURIComponent(credentials.token)}`;
+
+  socket = new WebSocket(url);
+
+  socket.onopen = () => {
+    attempts = 0;
+    needsNewSession = false;
+    retry.hidden = true;
+    setLive(true, "connected");
+  };
+
+  socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.error) { bubble("note", data.error); return; }
+
+    const movement = data.moved
+      ? `<span class="moved">moved</span> to ${data.state}`
+      : `<span class="stuck">stayed</span> in ${data.state}`;
+    const understood = data.understood ? "" : " &middot; not understood";
+    // The machine decides the language; we follow it. It can change mid-call
+    // when somebody asks to switch, and the voice has to follow with it.
+    if (data.language) language = data.language;
+    if (data.turn) turnPolicy = data.turn;
+    if (typeof data.server_stt === "boolean") {
+      const changed = serverStt !== data.server_stt;
+      serverStt = data.server_stt;
+      // Say which voice path is live, once. Two rounds of debugging were
+      // spent not knowing whether the page had actually picked up a change,
+      // and "which mode am I in" should never be a guess.
+      if (!announcedMode || changed) {
+        announcedMode = true;
+        note(serverStt
+          ? "Voice: recording in the browser, transcribed by Sarvam on the server."
+          : "Voice: Chrome's own recogniser (free, but silent on some machines).");
+      }
+    }
+    const voice = data.audio ? " &middot; sarvam voice" : "";
+    bubble("agent", data.text, movement + understood + voice);
+    recordState(data.state, data.moved);
+
+    // Server audio when it came, the browser's own voice when it did not.
+    if (!(data.audio && playFromServer(data.audio))) speak(data.text);
+
+    // Hands-free: listen again once the agent has stopped talking. Started
+    // after the reply rather than during it, so the first thing the detector
+    // measures is the room and not the agent's own voice.
+    if (handsfree.checked && !data.finished && canListen) {
+      waitForQuiet(() => { if (!listening) startListening(); });
+    }
+
+    if (data.finished) {
+      setLive(false, "session finished");
+      bubble("note", "This session is complete. Reload to start another.");
+    }
+  };
+
+  socket.onclose = (event) => {
+    if (event.code === 1008) {
+      // The session this page holds no longer exists on the server. In
+      // practice that almost always means the server restarted -- sessions
+      // live in memory, so a restart drops every one of them. Reconnecting
+      // cannot help; the only recovery is a new session, so offer that
+      // rather than leaving the page stuck saying "not authorised".
+      setLive(false, "session expired");
+      bubble("note", "This session is no longer on the server, most likely because it restarted.");
+      needsNewSession = true;
+      retry.textContent = "Start a new session";
+      retry.hidden = false;
+      return;
+    }
+
+    setLive(false, "disconnected");
+
+    // Reconnecting resumes the same session -- the server reloads it and
+    // carries on from whatever state it is actually in. Same mechanism the
+    // KYC handoff uses; a dropped socket is just a very short version of it.
+    //
+    // Backoff rather than a fixed interval: a server that is down stays down
+    // for a while, and retrying every 1.5s forever hammers it through its
+    // own recovery. Give up eventually and say so -- an application that
+    // claims to be "reconnecting…" an hour later is lying to the user.
+    if (attempts >= MAX_ATTEMPTS) {
+      bubble("note", "Could not reconnect. The server may not be running.");
+      retry.hidden = false;
+      statusEl.textContent = "offline";
+      return;
+    }
+
+    const wait = Math.min(1000 * Math.pow(2, attempts), MAX_BACKOFF_MS);
+    attempts += 1;
+    bubble("note", `Connection lost. Retrying in ${Math.round(wait / 1000)}s…`);
+    setTimeout(connect, wait);
+  };
+}
+
+function sendUtterance(text, confidence) {
+  const trimmed = (text || "").trim();
+  if (!trimmed || !socket || socket.readyState !== WebSocket.OPEN) return;
+
+  const spoken = typeof confidence === "number";
+  bubble("you", trimmed, spoken
+    ? `heard &middot; confidence ${confidence.toFixed(2)}`
+    : "typed");
+
+  const message = { utterance: trimmed };
+  // Omitted entirely when typed. Nobody mishears a keyboard, and the server
+  // treats a missing field as certain rather than as zero.
+  if (spoken) message.confidence = confidence;
+  // Only reported where the server said it matters -- barge-in is normal, and
+  // a row for every one of them is noise in the trail.
+  if (interruptedThisTurn && turnPolicy.report_interruption) message.interrupted = true;
+  interruptedThisTurn = false;
+  socket.send(JSON.stringify(message));
+  input.value = "";
+}
+
+function submit() {
+  sendUtterance(input.value, null);
+}
+
+retry.addEventListener("click", () => {
+  attempts = 0;
+  retry.hidden = true;
+
+  if (needsNewSession) {
+    // A genuinely new application. Clear the transcript so the old one is
+    // not mistaken for part of it.
+    needsNewSession = false;
+    retry.textContent = "Reconnect";
+    chat.replaceChildren();
+    trail.replaceChildren();
+    bubble("note", "Starting a new session…");
+    start();
+    return;
+  }
+
+  bubble("note", "Reconnecting…");
+  connect();
+});
+
+send.addEventListener("click", submit);
+input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+
+// Poll rather than rely on an ended event, because the reply may be spoken by
+// the browser (speechSynthesis) or played as a file, and only one of those has
+// a reliable one.
+function waitForQuiet(then) {
+  const started = performance.now();
+  (function check() {
+    if (!agentIsTalking() || performance.now() - started > 20000) {
+      setTimeout(then, 250);   // a beat, so it does not feel like an interruption
+      return;
+    }
+    setTimeout(check, 120);
+  })();
+}
+
+mic.addEventListener("click", () => {
+  if (listening) {
+    stopDetector(); stopMeter();
+    if (recognition) { try { recognition.stop(); } catch (e) {} }
+    return;
+  }
+  startListening();
+});
+
+tts.addEventListener("change", () => {
+  if (!tts.checked) stopSpeaking();
+});
+
+if (!canListen) {
+  mic.title = "This browser has no speech recognition — Chrome, Edge or Safari do";
+}
+
+// getVoices() is empty until the list loads, so a first reply can arrive
+// before any voice exists. Touching it here primes the list.
+if (canSpeak) {
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+}
+
+start();
+</script>
+</body>
+</html>
