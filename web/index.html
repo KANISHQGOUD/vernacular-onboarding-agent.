@@ -216,6 +216,64 @@ function note(text) {
   bubble("note", text);
 }
 
+// Why the recogniser might have heard nothing, asked of the browser rather
+// than guessed at.
+//
+// "Started, ended, no results, no error" is the least informative failure
+// this page can produce, and it has two completely different causes: the
+// microphone was never granted, or it was granted and the wrong device is
+// selected. The Permissions API separates them in one call, and knowing
+// which one it is turns a debugging session into a single click.
+//
+// An embedded or automation browser is the third case, and the one nobody
+// thinks to check: it reports permission "denied" and offers a device with
+// no label, because it cannot capture at all. The user agent names it.
+async function micTrouble() {
+  const embedded = / Claude\/|HeadlessChrome|Electron/.test(navigator.userAgent);
+
+  let state = "unknown";
+  try {
+    state = (await navigator.permissions.query({ name: "microphone" })).state;
+  } catch (err) {
+    state = "unavailable";
+  }
+
+  let devices = 0;
+  let named = 0;
+  try {
+    const all = await navigator.mediaDevices.enumerateDevices();
+    const ins = all.filter(d => d.kind === "audioinput");
+    devices = ins.length;
+    named = ins.filter(d => d.label).length;
+  } catch (err) {
+    /* enumeration is not essential; the permission state carries the answer */
+  }
+
+  if (embedded) {
+    return "This is an embedded browser, which cannot open a microphone at "
+         + "all — no setting will fix it. Open http://localhost:8000 in real "
+         + "Chrome, or use the text box, which does the same thing.";
+  }
+  if (state === "denied") {
+    return "Microphone permission is DENIED for this site. Click the padlock "
+         + "in the address bar, set Microphone to Allow, and reload.";
+  }
+  if (devices === 0) {
+    return "The browser reports no audio input devices at all — this is an "
+         + "operating-system or hardware problem, not a permission one.";
+  }
+  if (state === "granted" && named === 0) {
+    return "Permission is granted but no input device has a name, which "
+         + "usually means the selected microphone is disconnected.";
+  }
+  if (state === "granted") {
+    return "Permission is granted and a device is present, so the microphone "
+         + "is being read and is silent — check which input Chrome is using "
+         + "via the padlock, and that it is not muted in Windows.";
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Turn-taking.
 //
@@ -771,12 +829,24 @@ function startListening() {
       // Name which half failed. From the outside a suspended audio context, a
       // recogniser that never got audio, and somebody sitting quietly all
       // look identical, and that is how this went round twice.
+      //
+      // The FIRST question is whether there is an audio reading at all. The
+      // Web Audio detector above is opt-in, so with the meter unticked there
+      // is none -- and an earlier version of this block read that as a
+      // failure and announced "the audio context is not started. This is not
+      // you." every single time. Confidently, and wrongly: it is the normal
+      // state of a disabled feature, and it sent a debugging session chasing
+      // an AudioContext that was never meant to be running.
       const audioAlive = micState && micState.framesSeen > 0;
       const recogAlive = recogState.results > 0;
 
-      if (!audioAlive) {
-        note("The level meter never read a frame — the audio context is not "
-           + (micState ? micState.context : "started") + ". This is not you.");
+      if (!meterOn.checked) {
+        note("The level meter is off, so there is no audio reading to show — "
+           + "that is expected, not a fault. Tick “mic meter” and say it "
+           + "again if you want one.");
+      } else if (!audioAlive) {
+        note("The level meter never read a frame — the audio context is "
+           + (micState ? micState.context : "not started") + ". This is not you.");
       } else if (micState.voicedFrames === 0) {
         note(
           `Read ${micState.framesSeen} frames, none above the speech threshold `
@@ -785,10 +855,19 @@ function startListening() {
           + `muted or the threshold is too high for this room.`
         );
       }
+
       if (!recogAlive) {
-        note("Chrome's recogniser returned nothing"
-           + (recogState.lastError ? ` (${recogState.lastError})` : "")
-           + " — it may not have got the microphone.");
+        // No error at all is a different failure from a named one, and the
+        // fix is different too: an error means Chrome refused, silence means
+        // Chrome listened to the wrong thing.
+        note(recogState.lastError
+          ? `Chrome's recogniser failed with “${recogState.lastError}”.`
+          : "Chrome's recogniser started and ended without a single result, "
+            + "and reported no error.");
+
+        // Asked of the browser rather than left to the reader. This is the
+        // line that actually names the fix.
+        micTrouble().then(reason => { if (reason) note(reason); });
       }
       note("Run micDiag() in the console and send me what it prints.");
     }
