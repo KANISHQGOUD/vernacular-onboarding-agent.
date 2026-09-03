@@ -172,7 +172,7 @@ Branch `master`, tree clean.
 > below are not like that: they are wrong only when the code changes, which
 > is what makes them worth writing down.
 
-**1120 tests pass, ~10s.** 1098 need no network and no keys; 22 need Postgres.
+**1125 tests pass, ~7s.** 1103 need no network and no keys; 22 need Postgres.
 One more is skipped by default: the live Sarvam round trip, which runs only
 under `SARVAM_LIVE=1` because it spends prepaid credit.
 
@@ -186,11 +186,15 @@ Terminal states: `COMPLETED`, `DECLINED`, `CONSENT_REFUSED`, `ABANDONED`,
 `HUMAN_HANDOFF`. Each is a different reason, because a funnel is only readable
 if the exits are distinguishable.
 
-Working end to end. The browser-in-Hindi verification was done in an
-earlier session **with a Gemini key present**; there is none in this
-environment now, so a server started today runs `OfflineClassifier` and
-understands nothing. Everything below is exercised by the suite against fakes;
-the classifier is the one layer whose live behaviour that cannot prove.
+Working end to end, and the classifier is verified against the live model,
+not only against fakes — `scripts/check_intents.py`.
+
+> A previous version of this section said there was no Gemini key here and
+> that the server therefore ran `OfflineClassifier`. That was wrong: the key
+> has always been in `.env`. The check that concluded otherwise was a
+> `python -c` one-liner, and `client.py` does not call `load_dotenv()` — only
+> `server.py` does, at import. Worth leaving written down, because the same
+> one-liner will lie the same way next time.
 
 - State machine, eligibility, mocked providers (KYC, core banking, payments)
 - Gemini classifier — intent and extraction folded into one constrained call
@@ -291,6 +295,27 @@ moves faster than this file.
   one. Do not redesign on one measurement.
 - Structured output is strong: a date spoken entirely in Hindi words
   ("ek janvari unnees sau nabbe") extracted as `1990-01-01`, no date parser.
+
+### The offline suite cannot see the classifier
+
+`scripts/check_intents.py` runs five real sentences past the live model and
+checks the intent *and* the amount. Opt in, like the Sarvam round trip,
+because it spends from the 20/day budget.
+
+It exists because of what it found. The activation intents shipped with their
+glosses checked and the prompt inspected, and both were fine — and every
+reading still came back with no amount, so "ek hazaar daal do" quietly
+deposited the suggested Rs 500. `_read_field` discards a value whose field is
+not in `COLLECTABLE_FIELDS`, which is exactly what keeps an arbitrary key out
+of the dict holding regulated personal data; an amount has no name in that
+set, so it was thrown away every time. **`amount` is its own slot** now, and
+`field`/`value` keep their applicant-only meaning.
+
+**1120 offline tests could not have caught that.** They fake the classifier,
+so both sides of the seam agreed with each other and neither agreed with
+reality. Five live calls found it in under a minute. Any change to
+`INTENT_GLOSS`, `build_schema` or `build_prompt` deserves a run of this
+script, because the suite will keep passing regardless.
 
 ## Speech
 
@@ -432,11 +457,6 @@ whole design exists to move.
   so uvicorn's 16 MB default is the real backstop. The cap in `server.py`
   bounds the Sarvam bill, which is the half that costs actual money. Fine on
   a laptop, wrong for anything reachable.
-- **The two activation intents have never met the live model.**
-  `DEPOSIT_REQUESTED` and `PAYMENT_REQUESTED` are offered at FUNDING and
-  FIRST_TRANSACTION and their glosses reach the prompt — both checked — but
-  whether Gemini reads "haan, paanch sau" as one of them is untested, because
-  there is no key here. Two requests would settle it.
 - **The pre-screen is still literals.** `Conversation._screen` passes
   `date(1990, 1, 1)`, `has_pan=True` and the rest as constants, so nobody is
   ever declined *before* collection and the pre-screen costs a caller nothing
