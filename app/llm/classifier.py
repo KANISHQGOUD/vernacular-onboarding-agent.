@@ -59,6 +59,11 @@ COLLECTABLE_FIELDS: tuple[str, ...] = tuple(sorted(REQUIRED_APPLICANT_FIELDS))
 # has started narrating rather than extracting.
 MAX_VALUE_LENGTH = 200
 
+# Rs 99,99,999.99 is nine digits and a point. Nobody opening their first
+# account is naming a figure longer than that out loud, and a first payment
+# is capped far below it anyway.
+MAX_AMOUNT_LENGTH = 12
+
 # What each option means, in plain words, for the model to match against.
 # Written as observable speech acts rather than internal jargon -- the model is
 # matching a sentence to one of these, so they describe what a person SAYS.
@@ -160,6 +165,9 @@ class Classification:
     intent: Event
     field: str | None = None
     value: str | None = None
+    # A sum of money they named, if any. Separate from `value`, which is only
+    # ever an applicant field's value -- see `build_schema`.
+    amount: str | None = None
     language: str | None = None
 
     @property
@@ -187,6 +195,27 @@ def build_schema(offered: list[Event]) -> types.Schema:
                 type=types.Type.STRING,
                 nullable=True,
                 description="What they said it was. Never invent this.",
+            ),
+            # A separate slot, and deliberately not `value`. An amount is not
+            # part of the applicant record, so it has no name in
+            # COLLECTABLE_FIELDS -- and `_read_field` discards any value whose
+            # field is not in that set, which is the check that keeps an
+            # arbitrary key out of the dict holding regulated personal data.
+            #
+            # The first attempt at this told the model to put the amount in
+            # `value` with `field` empty. That check then threw it away every
+            # time, silently, and the caller got the suggested amount instead
+            # of the thousand rupees they asked for. The check was right; the
+            # amount just does not belong in that pair.
+            "amount": types.Schema(
+                type=types.Type.STRING,
+                nullable=True,
+                description=(
+                    "A sum of money they named, in rupees, as digits with no "
+                    "separators or symbols -- \"paanch sau\" is 500, "
+                    "\"ek hazaar\" is 1000. Leave out when they simply "
+                    "agreed without naming a figure. Never invent one."
+                ),
             ),
             "language": types.Schema(
                 type=types.Type.STRING,
@@ -216,6 +245,11 @@ def build_prompt(utterance: str, offered: list[Event]) -> str:
     return (
         f"Possible meanings:\n{meanings}\n\n"
         f"Information being collected:\n{fields}\n\n"
+        # Amounts live in their own slot rather than in `field`/`value`,
+        # because they are not part of the applicant record. See build_schema.
+        "If they name a sum of money, put the number of rupees in `amount` "
+        "as digits with no separators or symbols -- \"paanch sau\" is 500, "
+        "\"ek hazaar\" is 1000.\n\n"
         f"<caller_words>\n{fenced}\n</caller_words>"
     )
 
@@ -288,6 +322,7 @@ class GeminiIntentClassifier:
             intent=validate_intent(event, state),
             field=field,
             value=value,
+            amount=self._read_amount(raw),
             language=self._read_language(raw),
         )
 
@@ -350,6 +385,28 @@ class GeminiIntentClassifier:
             return None, None
 
         return field, cleaned
+
+    @staticmethod
+    def _read_amount(raw: dict) -> str | None:
+        """Digits only, and short.
+
+        Re-checked here rather than trusted from the schema, for the same
+        reason `_read_field` re-checks the field name: the schema should
+        already guarantee it, and this is what makes the guarantee provable.
+        `paise_from_text` would ignore anything else anyway -- this keeps a
+        sentence out of the slot rather than relying on that.
+        """
+        amount = raw.get("amount")
+        if not isinstance(amount, str):
+            return None
+
+        cleaned = amount.strip()
+        if not cleaned or len(cleaned) > MAX_AMOUNT_LENGTH:
+            return None
+        if not all(ch.isdigit() or ch == "." for ch in cleaned):
+            log.warning("model returned a non-numeric amount; discarded")
+            return None
+        return cleaned
 
     @staticmethod
     def _read_language(raw: dict) -> str | None:

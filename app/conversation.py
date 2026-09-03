@@ -288,7 +288,8 @@ class Conversation:
         """
         if reading.intent is Event.DEPOSIT_REQUESTED and session.state is State.FUNDING:
             self.actions.initiate_deposit(
-                session, paise_from_text(reading.value or "") or SUGGESTED_DEPOSIT_PAISE
+                session,
+                paise_from_text(reading.amount or "") or SUGGESTED_DEPOSIT_PAISE,
             )
             return None
 
@@ -299,7 +300,7 @@ class Conversation:
             self.actions.make_first_payment(
                 session,
                 DEMO_PAYEE,
-                paise_from_text(reading.value or "") or SUGGESTED_PAYMENT_PAISE,
+                paise_from_text(reading.amount or "") or SUGGESTED_PAYMENT_PAISE,
             )
             return None
 

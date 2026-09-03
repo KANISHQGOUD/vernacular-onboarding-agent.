@@ -703,8 +703,8 @@ def test_saying_yes_uses_the_suggested_amounts():
 def test_an_amount_they_name_wins_over_the_suggestion():
     """It is a suggestion, not a default."""
     _, session, _, _ = _at_funding(
-        Classification(Event.DEPOSIT_REQUESTED, value="2000"),
-        Classification(Event.PAYMENT_REQUESTED, value="50"),
+        Classification(Event.DEPOSIT_REQUESTED, amount="2000"),
+        Classification(Event.PAYMENT_REQUESTED, amount="50"),
     )
     assert session.state is State.COMPLETED
     assert session.deposit_paise == 200_000
@@ -713,8 +713,8 @@ def test_an_amount_they_name_wins_over_the_suggestion():
 
 def test_an_amount_spoken_in_devanagari_is_the_same_amount():
     _, session, _, _ = _at_funding(
-        Classification(Event.DEPOSIT_REQUESTED, value="१०००"),
-        Classification(Event.PAYMENT_REQUESTED, value="७५"),
+        Classification(Event.DEPOSIT_REQUESTED, amount="१०००"),
+        Classification(Event.PAYMENT_REQUESTED, amount="७५"),
     )
     assert session.deposit_paise == 100_000
     assert session.first_payment_paise == 7_500
@@ -724,7 +724,7 @@ def test_the_confirmation_says_what_was_actually_paid():
     """It used to read a constant, which was right only by coincidence."""
     _, session, _, replies = _at_funding(
         Classification(Event.DEPOSIT_REQUESTED),
-        Classification(Event.PAYMENT_REQUESTED, value="50"),
+        Classification(Event.PAYMENT_REQUESTED, amount="50"),
     )
     assert "50.00" in replies[-1].text
 
@@ -745,8 +745,8 @@ def test_an_amount_over_our_ceiling_is_explained_not_swallowed():
     try again, rather than being asked the same question a second time."""
     _, session, _, replies = _at_funding(
         Classification(Event.DEPOSIT_REQUESTED),
-        Classification(Event.PAYMENT_REQUESTED, value="100000"),
-        Classification(Event.PAYMENT_REQUESTED, value="50"),
+        Classification(Event.PAYMENT_REQUESTED, amount="100000"),
+        Classification(Event.PAYMENT_REQUESTED, amount="50"),
     )
     refusal = replies[-2].text
     assert "500.00" in refusal, "the limit is not stated in rupees"

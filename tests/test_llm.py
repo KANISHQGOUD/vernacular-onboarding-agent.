@@ -36,12 +36,14 @@ class FakeClient:
         text: str | None = None,
         field: str | None = None,
         value: str | None = None,
+        amount: str | None = None,
         language: str | None = None,
     ):
         self._answer = {
             "intent": choose,
             "field": field,
             "value": value,
+            "amount": amount,
             "language": language,
         }
         self._text = text
@@ -321,3 +323,60 @@ def test_an_api_failure_raises_rather_than_looking_like_a_mumble():
             prompt="hindi",
             schema=types.Schema(type=types.Type.OBJECT),
         )
+
+
+# ---------------------------------------------------------------------------
+# The amount slot. Separate from field/value, and re-checked like everything.
+# ---------------------------------------------------------------------------
+
+
+def _reads(state, **answer):
+    classifier = GeminiIntentClassifier(FakeClient(**answer))
+    return classifier.read("spoken", state)
+
+
+def test_an_amount_survives_because_it_is_not_a_field():
+    """The first attempt put the amount in `value` with `field` empty, and
+    `_read_field` discarded it every time -- correctly, since that check is
+    what keeps an arbitrary key out of the dict holding regulated personal
+    data. The amount needed its own slot rather than a hole in that check."""
+    reading = _reads(State.FUNDING, choose="DEPOSIT_REQUESTED", amount="1000")
+
+    assert reading.amount == "1000"
+    assert reading.field is None
+    assert reading.value is None
+
+
+def test_agreeing_without_a_figure_names_no_amount():
+    """A bare "haan" has to leave the suggestion in place."""
+    reading = _reads(State.FUNDING, choose="DEPOSIT_REQUESTED")
+    assert reading.amount is None
+
+
+def test_words_in_the_amount_slot_are_discarded():
+    """Re-checked here rather than trusted from the schema, for the same
+    reason the field name is.
+
+    Short on purpose. A first version used "about five hundred", which is 18
+    characters -- so MAX_AMOUNT_LENGTH caught it and the digit check was never
+    exercised at all. The test passed against a version with no digit check.
+    """
+    for words in ("five", "many", "Rs 5", "5e9"):
+        assert _reads(State.FUNDING, choose="DEPOSIT_REQUESTED", amount=words).amount is None, words
+
+
+def test_an_absurdly_long_amount_is_discarded():
+    reading = _reads(State.FUNDING, choose="DEPOSIT_REQUESTED", amount="9" * 40)
+    assert reading.amount is None
+
+
+def test_the_amount_slot_cannot_smuggle_a_field_value():
+    """`amount` must never become a second door into `applicant`."""
+    reading = _reads(
+        State.FUNDING, choose="DEPOSIT_REQUESTED", amount="500", field="full_name", value="Asha"
+    )
+    assert reading.amount == "500"
+    # The field pair still travels on its own merits, and COLLECT_DATA is the
+    # only state that ever writes it -- see `_record_after_moving`.
+    assert reading.field == "full_name"
+
