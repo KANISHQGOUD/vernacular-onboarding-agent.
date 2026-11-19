@@ -471,7 +471,11 @@ whole design exists to move.
   marks space reusable without zeroing it. Only `VACUUM FULL`/`pg_repack`
   rewrite it away, and the WAL and older backups keep it longer. A real DPDP
   response needs an operational procedure, not a method call.
-- **No README.** For a portfolio project that is the gap a reader hits first.
+- **The README drifts.** It exists (this item used to say it did not, which
+  was wrong for at least 20 commits) and was itself 20 commits stale on
+  2026-11-19: a test count of 944, and none of the re-screen, the amount slot,
+  the caller-made first transaction or the log rule. It has no check, so any
+  commit that changes behaviour a reader would notice should touch it too.
 
 ---
 

@@ -18,8 +18,9 @@ Acquisition is not the bottleneck. **Activation is.**
 So the metric this project optimises is **first-transaction completion rate,
 not accounts opened**. An applicant who reaches "account created" and stops has
 produced exactly the dormant account the exercise was meant to prevent — and
-the state machine says so out loud: reaching `ACCOUNT_CREATE` is not a terminal
-state, and quitting there is recorded as an abandonment, not a success.
+the state machine says so out loud: an open account is not a terminal state.
+The caller makes their own first deposit and first payment, and stopping
+before that is counted as a dormant account, not a success.
 
 ## The one design claim
 
@@ -125,6 +126,47 @@ product exists to remove. Unreachability now raises rather than returning
 funnel apart from refusals, so a vendor's bad afternoon cannot be read as
 people failing.
 
+**The machine was finishing the job for the caller.** The first deposit and
+the first payment were steps the machine took automatically, so the moment an
+account existed it deposited Rs 500, paid a shop Rs 125.50 and marked the
+session complete — in the same turn, without asking anyone. The caller was
+never even told their account had opened. Worse, "opened but never used" was
+structurally zero for every real session, so the one number this project
+exists to move could not move. It only ever looked right against the
+synthetic journeys in the funnel tests. Those two states now wait for the
+caller, and a test pins exactly which states wait for a person.
+
+**The age gate had never seen a real age.** Eligibility runs before data
+collection, on placeholder answers, so the rules decided on a hard-coded date
+of birth that always passed. The engine could always decline a minor; it was
+never shown one. Combined with the rule that a field accepts the caller's
+answer after three failed checks, a 17-year-old who repeated their real date
+of birth three times was onboarded — verified before the fix, not inferred.
+The rules now run again on the date the caller actually gave. Recognising a
+field gives up after three tries; the law does not.
+
+**"Ek hazaar daal do" deposited Rs 500.** Every offline test passed, because
+they fake the classifier, so both sides of that seam agreed with each other
+and neither agreed with the model. Five sentences against the live model
+found it in under a minute: the amount came back in a slot that the
+personal-data filter correctly discards. An amount now has its own slot, and
+`scripts/check_intents.py` runs those five sentences on demand, because any
+prompt change can break this while the suite stays green.
+
+**A debug line put the caller's words in the log.** Added while chasing a
+microphone bug: the full transcript, at INFO, on the one store with no erasure
+story. It passed 1052 tests, because nothing had ever checked application
+logs. Three tests now do.
+
+**Sarvam reports no transcription confidence**, so the per-state floors above
+do nothing on that provider. Two replacements that do not depend on a vendor:
+field rules (a mobile is ten digits starting 6–9; a date of birth must give an
+age of 18 to 120), and reading the value back before writing it down —
+*"I have your full name as Asha Devri. Is that right?"* — for the mobile,
+date of birth and name. A number says the recogniser was unsure. A rule says
+the answer is impossible, and the caller is the only one who knows if it is
+right.
+
 ## Try it
 
 Requires Python 3.13 and, optionally, Docker.
@@ -141,8 +183,19 @@ py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-**944 tests, no API key and no network required.** Everything external is
-behind a seam with an offline implementation, which is the point.
+**1103 tests, no API key and no network required.** Everything external is
+behind a seam with an offline implementation, which is the point. Another 22
+run against Postgres when `DATABASE_URL` points at a live database (see
+below). The live Sarvam round trip runs only under `SARVAM_LIVE=1`, because it
+spends prepaid credit.
+
+The offline suite cannot see what the real model does with a sentence. After
+any change to the classifier prompt or schema, also run the live check, which
+spends 5 of the free tier's 20 requests a day:
+
+```bash
+.venv\Scripts\python.exe scripts/check_intents.py
+```
 
 To talk to it, copy `.env.example` to `.env`, add a free
 [Gemini key](https://aistudio.google.com/apikey), and:
@@ -158,8 +211,15 @@ one, add a [Sarvam key](https://dashboard.sarvam.ai) and start it with
 `SARVAM_TTS=1`. Synthesis is cached on disk, so repeated phrases cost nothing
 after the first time.
 
+If Chrome's recogniser returns nothing on your machine (it fails silently
+when it cannot reach Google's speech service), start with `SARVAM_STT=1`
+instead. The page then records the audio and the server transcribes it with
+Sarvam. That costs about Rs 0.008 per second, and Sarvam reports no confidence,
+which is why the read-back above exists.
+
 Durable sessions need Postgres; see [CLAUDE.md](CLAUDE.md) for the container.
-Without it the app runs on in-memory storage and a restart drops live sessions.
+Without it, or if the database cannot be reached at startup, the app warns and
+runs on in-memory storage, so a restart drops live sessions.
 
 ## Choosing a recogniser with numbers
 
@@ -217,10 +277,26 @@ ship a folder of real people saying their names into a public repository.
 Tick **hands-free** and the button stops mattering: the agent listens, decides
 you have finished, answers, and listens again.
 
-The detector runs in the browser, because that is where the microphone is.
-Silero VAD was the original plan and does not fit — it runs server-side on
-audio frames, and in this topology the server never receives audio, because
-recognition happens in the page.
+By default, turn-taking runs off the recogniser's own results. Every result,
+interim ones included, pushes the end-of-turn timer back, and when results
+stop arriving for the current state's window, the turn ends. An earlier
+version ran a separate audio detector, which opened a second microphone
+stream. On some machines the two competed for the device, the recogniser
+lost, and it quietly received silence — indistinguishable from a working
+system with nothing to say. The recogniser's results exist whenever
+recognition works at all, so turn-taking built on them cannot leave the
+caller unable to speak. Barge-in works the same way.
+
+The audio-energy detector is still there, behind the **mic meter** checkbox,
+off by default. It reacts sooner and hears sound the recogniser never
+transcribes. Under `SARVAM_STT=1` the page records instead of recognising, and
+the detector reads that one recording stream for endpointing, so nothing
+competes.
+
+Silero VAD was the original plan. It runs server-side on audio frames, so it
+does not fit the free path, where recognition happens in the page and the
+server never receives audio. Under `SARVAM_STT=1` the server does receive
+clips, so the option is open there.
 
 What stays server-side is the **policy**: how long a pause means "finished".
 That is a judgement about the conversation rather than about audio, so
@@ -272,8 +348,8 @@ fixable by choosing a better number:
   the monitor's refresh rate, which is nobody's sampling decision. Now a
   50 ms interval.
 
-The level meter beside the controls shows the microphone and turns red when
-speech is detected. What remains unverified is *your* room and *your*
+With **mic meter** ticked, the level meter beside the controls shows the
+microphone and turns red when speech is detected. What remains unverified is *your* room and *your*
 microphone — the numbers above come from real speech, not from real ambient
 noise. The decision logic has its own cases:
 
@@ -350,6 +426,14 @@ speech, but the audio path has never run against a live microphone — this
 machine's automation browser blocks capture. The endpoint *windows* are
 reasoned from the product rather than measured against recordings of people
 hesitating, which is the same thing everything else here is waiting on.
+
+**Also open:** nothing yet fires a lapse when a caller goes quiet (the method
+exists and is tested; no timer calls it). The eligibility pre-screen still
+runs on placeholder answers, so it turns nobody away before collection; the
+re-screen on the real date of birth is what currently enforces the age rule.
+And with Sarvam transcription, the consent gate has no confidence check — the
+read-back covers the mobile, date of birth and name, but not consent. The
+full list, with the reasoning, is in [CLAUDE.md](CLAUDE.md).
 
 ## Where to read next
 
