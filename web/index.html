@@ -990,19 +990,61 @@ function setLive(live, label) {
   if (live) input.focus();
 }
 
+// The access code for a public deployment arrives in the link's FRAGMENT
+// (https://host/#code=...), because a fragment is never sent to any server:
+// not this one's access log, not the host's proxy. It then travels only as a
+// header on the one request that needs it. Asked for once if the link had
+// none, and kept for the tab so a reload does not ask again.
+function accessCode() {
+  const fromLink = new URLSearchParams(location.hash.slice(1)).get("code");
+  if (fromLink) return fromLink;
+  try { return sessionStorage.getItem("accessCode") || ""; } catch { return ""; }
+}
+
 async function start() {
-  const created = await fetch("/api/session", { method: "POST" }).then(r => r.json());
-  credentials = created;
+  let code = accessCode();
+  let response = await fetch("/api/session", {
+    method: "POST",
+    headers: code ? { "X-Access-Code": code } : {},
+  });
+
+  if (response.status === 401) {
+    code = (window.prompt("This demo needs an access code. It came with the link you were sent.") || "").trim();
+    if (code) {
+      response = await fetch("/api/session", {
+        method: "POST",
+        headers: { "X-Access-Code": code },
+      });
+    }
+  }
+
+  if (!response.ok) {
+    const reason = await response.json().then(b => b.error).catch(() => "");
+    setLive(false, "not started");
+    bubble("note", response.status === 429
+      ? "Today's demo sessions are used up. Please try again tomorrow."
+      : `Could not start a session${reason ? `: ${reason}` : "."}`);
+    needsNewSession = true;
+    retry.textContent = "Try again";
+    retry.hidden = false;
+    return;
+  }
+
+  try { if (code) sessionStorage.setItem("accessCode", code); } catch { /* private mode */ }
+  credentials = await response.json();
   connect();
 }
 
 function connect() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
+  // The session id is a name and may sit in the URL. The token is the
+  // secret, so it rides in the handshake's Sec-WebSocket-Protocol header,
+  // the one header a browser lets a page set on a socket -- never in a URL,
+  // where every access log and proxy on the way would write it down.
   const url = `${scheme}://${location.host}/ws`
-    + `?session=${encodeURIComponent(credentials.session_id)}`
-    + `&token=${encodeURIComponent(credentials.token)}`;
+    + `?session=${encodeURIComponent(credentials.session_id)}`;
 
-  socket = new WebSocket(url);
+  socket = new WebSocket(url, ["onboarding.v1", `token.${credentials.token}`]);
 
   socket.onopen = () => {
     attempts = 0;

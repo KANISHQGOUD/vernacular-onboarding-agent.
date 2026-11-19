@@ -172,7 +172,7 @@ Branch `master`, tree clean.
 > below are not like that: they are wrong only when the code changes, which
 > is what makes them worth writing down.
 
-**1125 tests pass, ~7s.** 1103 need no network and no keys; 22 need Postgres.
+**1154 tests pass, ~7s.** 1132 need no network and no keys; 22 need Postgres.
 One more is skipped by default: the live Sarvam round trip, which runs only
 under `SARVAM_LIVE=1` because it spends prepaid credit.
 
@@ -248,6 +248,32 @@ docker run -d --name onboarding-db -p 5432:5432 -e POSTGRES_PASSWORD=dev -e POST
 purpose.
 
 ---
+
+## Deploying it
+
+Strict by default: the `Dockerfile` sets `PUBLIC_DEPLOYMENT=1`, and in that
+mode `create_app` refuses to start unless `ACCESS_CODE` (12+ chars),
+`MAX_SESSIONS_PER_DAY`, `DATABASE_URL` and `GOOGLE_API_KEY` are all set --
+listing every missing one at once -- and the database actually answers.
+Without the flag, local development is unchanged: no code, no cap, memory
+fallback.
+
+- **The token never travels in a URL.** REST takes `Authorization: Bearer`;
+  the socket takes it as the subprotocol `token.<token>` beside
+  `onboarding.v1`, because a browser cannot set headers on a WebSocket. A
+  query-string token is ignored, not honoured. Verified in a real browser
+  and against the container's access log on 2026-11-19.
+- **The access code goes in the link's fragment**, `https://host/#code=...`.
+  Fragments never reach a server, so the code is not in any log either.
+- **Start with `python -m app.web`**, never a bare uvicorn command: it pins
+  the frame limit, one worker and proxy headers in code.
+- `SPEECH_CACHE_DIR` (default in the image: `/data/speech-cache`) should be
+  a persistent volume, or every deploy pays for the fixed phrases again.
+- Run `scripts/db.py apply` against the hosted database once.
+
+Smoke-tested on 2026-11-19 by building the image and running it against the
+local Postgres: refuses with no environment, then 401 / 401 / 200 / 200 / 429
+for no code, wrong code and a cap of 2.
 
 ## This machine — these cost time to find
 
@@ -452,11 +478,14 @@ whole design exists to move.
   the first run scored 150.6% WER for an engine that misheard nothing. An
   engine that normalises is penalised against one that does not, which means
   a naive table recommends the worse recogniser.
-- **`--ws-max-size` is what bounds memory, and nothing sets it.**
-  `receive_json()` reads the whole frame before `MAX_AUDIO_BYTES` can see it,
-  so uvicorn's 16 MB default is the real backstop. The cap in `server.py`
-  bounds the Sarvam bill, which is the half that costs actual money. Fine on
-  a laptop, wrong for anything reachable.
+- **The daily session cap is per process.** `app/web/gate.py` counts in
+  memory, which is right only because `python -m app.web` pins one worker.
+  More workers would each count separately; move the count into Postgres
+  first.
+- **The frame limit is only enforced by `python -m app.web`.** It passes
+  `server.WS_MAX_SIZE` (~564 KB, derived from the audio cap) to uvicorn. The
+  plain `uvicorn app.web.server:app` command used for local development still
+  gets uvicorn's 16 MB default.
 - **The pre-screen is still literals.** `Conversation._screen` passes
   `date(1990, 1, 1)`, `has_pan=True` and the rest as constants, so nobody is
   ever declined *before* collection and the pre-screen costs a caller nothing

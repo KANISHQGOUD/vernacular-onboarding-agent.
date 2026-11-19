@@ -294,7 +294,7 @@ def test_a_transcript_never_reaches_a_log_line(caplog):
     import base64
 
     from app.speech import MockSpeech, Transcript
-    from tests.test_web import build_client, open_session, socket_url
+    from tests.test_web import build_client, connect, open_session
 
     said = "मेरा नाम आशा देवी है, 14 Gandhi Road, Nashik"
     speech = MockSpeech(
@@ -307,7 +307,7 @@ def test_a_transcript_never_reaches_a_log_line(caplog):
     client, _ = build_client(speech=speech)
     created = open_session(client)
 
-    with client.websocket_connect(socket_url(created)) as socket:
+    with connect(client, created) as socket:
         socket.receive_json()
         socket.send_json({"audio": base64.b64encode(b"pretend this is opus").decode()})
         socket.receive_json()

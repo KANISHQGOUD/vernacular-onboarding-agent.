@@ -1,2 +1,4 @@
 -r requirements.txt
-pytest
+pytest==9.1.1
+# FastAPI's TestClient needs it, and nothing above pulls it in.
+httpx==0.28.1

@@ -183,7 +183,7 @@ py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-**1103 tests, no API key and no network required.** Everything external is
+**1132 tests, no API key and no network required.** Everything external is
 behind a seam with an offline implementation, which is the point. Another 22
 run against Postgres when `DATABASE_URL` points at a live database (see
 below). The live Sarvam round trip runs only under `SARVAM_LIVE=1`, because it
@@ -220,6 +220,32 @@ which is why the read-back above exists.
 Durable sessions need Postgres; see [CLAUDE.md](CLAUDE.md) for the container.
 Without it, or if the database cannot be reached at startup, the app warns and
 runs on in-memory storage, so a restart drops live sessions.
+
+## Putting it on a public URL
+
+The `Dockerfile` builds the image a public demo runs, and it is strict on
+purpose. Every session spends from budgets nobody can top up for free --
+Gemini's free tier is 20 requests a day, about three conversations, and Sarvam
+is a one-time credit -- so an open URL would be drained by the first bot that
+found it. With `PUBLIC_DEPLOYMENT=1`, which the image sets, the server will
+not start until all of these are set, and it lists every missing one at once:
+
+| variable | why |
+|---|---|
+| `ACCESS_CODE` | at least 12 characters; nobody without it can start a session |
+| `MAX_SESSIONS_PER_DAY` | pick it from your Gemini tier; the session after the cap gets a polite "try tomorrow", not a dead page |
+| `DATABASE_URL` | must be reachable; a public server never quietly falls back to memory |
+| `GOOGLE_API_KEY` | otherwise the agent understands nothing |
+
+Share the link as `https://your-host/#code=<ACCESS_CODE>`. The part after `#`
+never leaves the browser, so the code does not end up in any server or proxy
+log. The session token does not either: it travels in headers, never in a
+URL.
+
+Any host that offers HTTPS, WebSockets and managed Postgres will do; the
+microphone only works on an `https://` page. Mount a persistent volume at
+`/data` so the speech cache survives deploys, and run
+`python scripts/db.py apply` against the database once.
 
 ## Choosing a recogniser with numbers
 

@@ -6,9 +6,25 @@ to say -- if there were, the guarantees the state machine provides would stop
 being guarantees, because the web layer would be a second way in.
 
     POST /api/session          mint a session and its bearer token
-    WS   /ws                   the conversation
-    GET  /api/session/{id}     state + audit trail (token required)
+                               (X-Access-Code header, when a code is set)
+    WS   /ws?session={id}      the conversation; token as a subprotocol
+    GET  /api/session/{id}     state + audit trail (Authorization: Bearer)
+    GET  /healthz              liveness, for the host's health check
     GET  /                     the page
+
+THE TOKEN NEVER TRAVELS IN A URL
+--------------------------------
+URLs are written down everywhere: uvicorn's access log, every reverse proxy
+and load balancer a host puts in front, browser history. A bearer token in a
+query string is a credential copied into all of them. So the REST endpoint
+takes it as `Authorization: Bearer`, and the socket -- where a browser cannot
+set headers at all -- takes it as a WebSocket subprotocol, `token.<token>`,
+which travels in the handshake's Sec-WebSocket-Protocol header. The session
+id stays in the URL: it is a name, not a secret, and
+test_knowing_the_session_id_is_not_enough is why that is safe.
+
+A token in the query string is ignored rather than honoured, so an old page
+that still puts it there fails closed instead of quietly leaking it.
 
 RECONNECT IS RESUME
 -------------------
@@ -19,17 +35,17 @@ applicant leaving for a video call and coming back hours later is just a very
 long disconnection -- which is why `Conversation.resume()` needed to be a real
 method rather than demo scaffolding.
 
-SESSIONS DO NOT SURVIVE A RESTART
----------------------------------
-The registry is in memory, so restarting the server drops every live session.
-A browser holding an old id and token then fails authorisation and gets a 1008
-close -- correctly, since that session genuinely no longer exists.
+SESSIONS SURVIVE A RESTART ONLY WITH POSTGRES
+--------------------------------------------
+Without DATABASE_URL the registry is in memory, so restarting the server
+drops every live session. A browser holding an old id and token then fails
+authorisation and gets a 1008 close -- correctly, since that session
+genuinely no longer exists. The page offers a new session rather than sitting
+on a dead one.
 
-Worth stating plainly because the symptom is confusing: the page says the
-session expired when the real cause is that the process did. The frontend
-handles it by offering a new session rather than sitting on a dead one, and
-the durable fix is the Postgres store the SessionStore protocol already exists
-for. Until then, a restart means starting over.
+That fallback is right on a laptop and wrong on a server, where nobody is
+watching the warning. Under PUBLIC_DEPLOYMENT=1 the server refuses to start
+instead -- see app/web/gate.py.
 
 WHAT THE SOCKET REFUSES
 -----------------------
@@ -60,7 +76,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -84,6 +100,12 @@ from app.providers.core_banking import MockCoreBanking
 from app.providers.kyc import MockKycProvider
 from app.providers.payments import MockPaymentRail
 from app.speech import Audio, CachedSpeech, SarvamSpeech, SpeechProvider
+from app.web.gate import (
+    Gate,
+    Refused,
+    is_public_deployment,
+    public_deployment_problems,
+)
 from app.web.registry import SessionRegistry
 
 # The CLI loaded this and the server did not, so uvicorn came up with no key
@@ -111,6 +133,21 @@ MAX_AUDIO_BYTES = 2 * (DEFAULT_PATIENCE_MS // 1000) * 128_000 // 8
 # Checked against the field as it arrives. Base64 is four characters per three
 # bytes, and decoding first would mean allocating the thing being refused.
 MAX_AUDIO_BASE64 = MAX_AUDIO_BYTES * 4 // 3 + 4
+
+# What uvicorn may read into memory for one WebSocket message, before any of
+# the checks above can see it. `receive_json()` takes the whole frame first,
+# so without this uvicorn's 16 MB default is the real ceiling on memory per
+# message -- the caps above bound the vendor bill, not the allocation.
+#
+# Derived from the largest legitimate message, the audio one, plus room for
+# the JSON around it. Passed to uvicorn by app/web/__main__.py, so the number
+# the server enforces cannot drift from the one it is derived from.
+WS_MAX_SIZE = MAX_AUDIO_BASE64 + 64 * 1024
+
+# The socket's own subprotocol, echoed back on accept. A browser that offers
+# subprotocols fails the handshake unless the server picks one of them.
+SUBPROTOCOL = "onboarding.v1"
+TOKEN_PREFIX = "token."
 
 # 1008 is "policy violation" -- the right answer to a socket that failed
 # authorisation, and deliberately the same answer for every reason it failed.
@@ -183,7 +220,13 @@ def build_speech() -> SpeechProvider | None:
     # is spoken in every call; paying twice for identical audio is a choice.
     # (Only synthesis is cached -- see app/speech/cache.py on why transcription
     # never can be.)
+    # SPEECH_CACHE_DIR points the cache at a persistent volume on a host.
+    # Most hosts wipe the container's own disk on every deploy, and a wiped
+    # cache is not an error -- it is every fixed phrase paid for again.
+    directory = os.getenv("SPEECH_CACHE_DIR", "").strip()
     log.info("server-side speech: Sarvam, cached")
+    if directory:
+        return CachedSpeech(inner=SarvamSpeech(api_key=key), directory=Path(directory))
     return CachedSpeech(inner=SarvamSpeech(api_key=key))
 
 
@@ -204,16 +247,23 @@ def server_transcription_enabled() -> bool:
     return os.getenv("SARVAM_STT", "").strip() == "1"
 
 
-def build_storage() -> tuple[SessionRegistry, object]:
+def build_storage(strict: bool = False) -> tuple[SessionRegistry, object]:
     """Postgres when DATABASE_URL is set, memory otherwise.
 
     The choice is made here and nowhere else. `SessionStore`, `TokenStore` and
     `AuditSink` have been protocols since the first commit, so everything above
     this function is identical either way -- including the state machine, which
     does not import either implementation.
+
+    `strict` is for a public deployment: no database, or one that cannot be
+    reached, is a reason not to start rather than a reason to fall back. A
+    server that quietly runs on memory loses every session and the whole audit
+    trail at each restart, and on a host nobody reads the warning.
     """
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
+        if strict:
+            raise RuntimeError("DATABASE_URL is empty; refusing to start in public mode")
         log.warning(
             "DATABASE_URL is empty -- sessions live in memory and a restart "
             "will drop every one of them"
@@ -237,7 +287,12 @@ def build_storage() -> tuple[SessionRegistry, object]:
         pool = open_pool(url)
         with pool.connection() as probe:
             probe.execute("SELECT 1")
-    except Exception:  # noqa: BLE001 - any failure to reach it means the same
+    except Exception as exc:  # noqa: BLE001 - any failure to reach it means the same
+        if strict:
+            raise RuntimeError(
+                "DATABASE_URL is set but the database is unreachable; "
+                "refusing to start in public mode"
+            ) from exc
         log.warning(
             "DATABASE_URL is set but the database is unreachable -- falling "
             "back to memory. Sessions will not survive a restart. Start it "
@@ -262,22 +317,53 @@ def create_app(
     conversation: Conversation | None = None,
     audit: InMemoryAuditSink | None = None,
     speech: SpeechProvider | None = None,
+    gate: Gate | None = None,
+    public: bool | None = None,
 ) -> FastAPI:
-    """Everything injectable, so tests never touch the network."""
+    """Everything injectable, so tests never touch the network.
+
+    `public` defaults to PUBLIC_DEPLOYMENT=1. In public mode every problem in
+    public_deployment_problems() stops the server before it serves anything,
+    all of them listed at once, and the database must actually answer.
+    """
+    public = is_public_deployment() if public is None else public
+    if public:
+        problems = public_deployment_problems()
+        if problems:
+            raise RuntimeError(
+                "refusing to start in public mode:\n  - " + "\n  - ".join(problems)
+            )
+
     if registry is None and audit is None:
-        registry, audit = build_storage()
+        registry, audit = build_storage(strict=public)
     audit = audit or InMemoryAuditSink()
     registry = registry or SessionRegistry()
     conversation = conversation or build_conversation(audit)
     speech = speech if speech is not None else build_speech()
+    gate = gate or Gate.from_env()
 
     app = FastAPI(title="Vernacular onboarding agent")
     app.state.registry = registry
     app.state.conversation = conversation
     app.state.audit = audit
+    app.state.gate = gate
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        # Liveness only. Readiness was settled at startup: in public mode a
+        # server that could not reach its database never got this far.
+        return JSONResponse({"ok": True})
 
     @app.post("/api/session")
-    async def create_session() -> JSONResponse:
+    async def create_session(
+        x_access_code: str = Header(default=""),
+    ) -> JSONResponse:
+        # Before anything is created or counted. See app/web/gate.py.
+        try:
+            gate.admit(x_access_code)
+        except Refused as refused:
+            return JSONResponse({"error": refused.reason}, status_code=refused.status)
+
         session, token = registry.create()
         return JSONResponse(
             {
@@ -288,8 +374,13 @@ def create_app(
         )
 
     @app.get("/api/session/{session_id}")
-    async def read_session(session_id: str, token: str = Query(default="")) -> JSONResponse:
-        session = registry.open(session_id, token)
+    async def read_session(
+        session_id: str, authorization: str = Header(default="")
+    ) -> JSONResponse:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer":
+            token = ""
+        session = registry.open(session_id, token.strip())
         if session is None:
             # Same answer for unknown and unauthorised, so this cannot be used
             # to discover which session ids exist.
@@ -322,17 +413,25 @@ def create_app(
     async def talk(
         socket: WebSocket,
         session: str = Query(default=""),
-        token: str = Query(default=""),
     ) -> None:
+        offered = socket.scope.get("subprotocols") or []
+        token = next(
+            (p[len(TOKEN_PREFIX):] for p in offered if p.startswith(TOKEN_PREFIX)),
+            "",
+        )
+        # Echo our own name back only if it was offered: the handshake fails
+        # in the browser if the server picks something the client never said.
+        chosen = SUBPROTOCOL if SUBPROTOCOL in offered else None
+
         loaded = registry.open(session, token)
         if loaded is None:
             # Accept then close, so the browser sees a close code it can report
             # rather than an opaque handshake failure.
-            await socket.accept()
+            await socket.accept(subprotocol=chosen)
             await socket.close(code=CLOSE_UNAUTHORISED)
             return
 
-        await socket.accept()
+        await socket.accept(subprotocol=chosen)
 
         # Opening a fresh session and resuming a suspended one are the same
         # act: run whatever the current state requires. A reconnecting client

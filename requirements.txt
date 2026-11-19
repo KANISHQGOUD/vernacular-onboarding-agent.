@@ -1,7 +1,14 @@
-requests
-python-dotenv
-google-genai
-fastapi
-uvicorn[standard]
-psycopg[binary,pool]
-sarvamai
+# Pinned exactly. google-genai and sarvamai have both disagreed with their own
+# live APIs (a retired model, a deprecated TTS model, a speaker list that is
+# wrong in both directions), and every workaround in this repo was measured
+# against these versions. An unpinned install on a server would quietly get
+# different ones. Upgrade deliberately, then run scripts/introspect_sdk.py,
+# scripts/check_intents.py and SARVAM_LIVE=1 pytest tests/test_speech.py.
+requests==2.34.2
+python-dotenv==1.2.2
+google-genai==2.18.1
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+psycopg[binary,pool]==3.3.4
+psycopg-pool==3.3.1
+sarvamai==0.1.31

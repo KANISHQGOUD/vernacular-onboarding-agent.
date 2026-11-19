@@ -1,0 +1,21 @@
+# Secrets. The image must never contain a key; the host injects them at run time.
+.env
+*.key
+
+# Local state and tooling.
+.venv/
+.git/
+.claude/
+.pytest_cache/
+**/__pycache__/
+*.py[cod]
+
+# Paid-for audio and recordings of people. The cache belongs on a volume, and
+# a recording of somebody's voice does not belong in an image at all.
+.speech-cache/
+corpus/
+*.wav
+*.mp3
+recordings/
+
+tests/
