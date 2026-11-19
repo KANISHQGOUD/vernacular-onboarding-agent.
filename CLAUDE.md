@@ -172,7 +172,7 @@ Branch `master`, tree clean.
 > below are not like that: they are wrong only when the code changes, which
 > is what makes them worth writing down.
 
-**1158 tests pass, ~7s.** 1136 need no network and no keys; 22 need Postgres.
+**1160 tests pass, ~7s.** 1138 need no network and no keys; 22 need Postgres.
 One more is skipped by default: the live Sarvam round trip, which runs only
 under `SARVAM_LIVE=1` because it spends prepaid credit.
 

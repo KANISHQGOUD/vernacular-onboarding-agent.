@@ -243,3 +243,18 @@ def test_the_health_check_answers():
 def test_the_module_level_app_built_in_local_mode():
     """Importing the server must not need a public environment."""
     assert server.app is not None
+
+
+def test_the_railway_config_agrees_with_the_code():
+    """One replica, because the daily cap is counted per process; a health
+    check on the route that exists; the schema applied before each release."""
+    import json
+    from pathlib import Path
+
+    config = json.loads((Path(__file__).parent.parent / "railway.json").read_text())
+    deploy = config["deploy"]
+
+    assert deploy["numReplicas"] == 1
+    assert deploy["healthcheckPath"] == "/healthz"
+    assert deploy["preDeployCommand"] == ["python scripts/db.py apply"]
+    assert config["build"]["builder"] == "DOCKERFILE"

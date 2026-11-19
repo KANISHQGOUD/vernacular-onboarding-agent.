@@ -25,6 +25,12 @@
   #status.live::before { content: "● "; color: var(--ok); }
   #status.dead::before { content: "● "; color: var(--accent); }
 
+  #demo-notice {
+    padding: 9px 20px; border-bottom: 1px solid var(--line); background: #2a2016;
+    font-size: 12.5px; line-height: 1.5; color: var(--text);
+  }
+  #demo-notice strong { color: var(--accent); }
+
   main { flex: 1; display: grid; grid-template-columns: 1fr 300px; min-height: 0; }
   @media (max-width: 760px) { main { grid-template-columns: 1fr; } #side { display: none; } }
 
@@ -73,6 +79,16 @@
   <span class="sub">speak any Indian language &middot; the state machine decides, the model only phrases</span>
   <span id="status">connecting</span>
 </header>
+
+<!-- Shown before anyone speaks, and never dismissed. The flow below asks for a
+     name, a date of birth and a mobile number in the voice of a bank, so a
+     visitor has to know first that it is not one, and where their words go. -->
+<div id="demo-notice" role="note">
+  <strong>Demo only.</strong> This is a portfolio project, not a bank: no real
+  account is opened and no money moves. Please don't give your real name, date
+  of birth or phone number &mdash; make some up. What you say is sent to Google
+  (speech recognition and Gemini) and, for the Indian-language voice, to Sarvam AI.
+</div>
 
 <main>
   <div id="chat"></div>

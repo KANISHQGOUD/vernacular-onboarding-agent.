@@ -183,7 +183,7 @@ py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-**1136 tests, no API key and no network required.** Everything external is
+**1138 tests, no API key and no network required.** Everything external is
 behind a seam with an offline implementation, which is the point. Another 22
 run against Postgres when `DATABASE_URL` points at a live database (see
 below). The live Sarvam round trip runs only under `SARVAM_LIVE=1`, because it

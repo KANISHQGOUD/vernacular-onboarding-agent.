@@ -747,3 +747,20 @@ def test_a_finished_session_is_refused_before_anything_is_billed():
         assert "error" in socket.receive_json()
 
     assert len(speech.expected) == billed_so_far, "a finished session was billed"
+
+
+def test_the_page_says_it_is_a_demo_before_anyone_speaks():
+    """The flow asks for a name, a date of birth and a mobile in the voice of
+    a bank. On a public URL a visitor must be told it is not one, and where
+    their words go, in the page itself -- not in a README they never open."""
+    client, _ = build_client()
+    page = client.get("/").text
+    notice = page[page.index('id="demo-notice"'):]
+    notice = notice[: notice.index("</div>")]
+
+    assert "Demo only" in notice
+    assert "not a bank" in notice
+    for vendor in ("Google", "Gemini", "Sarvam"):
+        assert vendor in notice
+    # Before the conversation, not buried under it.
+    assert page.index('id="demo-notice"') < page.index('id="chat"')
