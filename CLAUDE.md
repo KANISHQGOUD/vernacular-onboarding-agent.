@@ -172,7 +172,7 @@ Branch `master`, tree clean.
 > below are not like that: they are wrong only when the code changes, which
 > is what makes them worth writing down.
 
-**1160 tests pass, ~7s.** 1138 need no network and no keys; 22 need Postgres.
+**1159 tests pass, ~7s.** 1137 need no network and no keys; 22 need Postgres.
 One more is skipped by default: the live Sarvam round trip, which runs only
 under `SARVAM_LIVE=1` because it spends prepaid credit.
 
@@ -270,6 +270,15 @@ fallback.
 - `SPEECH_CACHE_DIR` (default in the image: `/data/speech-cache`) should be
   a persistent volume, or every deploy pays for the fixed phrases again.
 - Run `scripts/db.py apply` against the hosted database once.
+
+**Railway** (chosen 2026-11-19). Its config-as-code file, `railway.json`, is
+deprecated: projects that never used it cannot opt in, and existing files stop
+working on 2026-12-01. So the service is configured in the dashboard, not the
+repo: pre-deploy command `python scripts/db.py apply`, healthcheck path
+`/healthz`, one replica. The Dockerfile at the root is picked up as the
+builder. Set `GEMINI_MODEL=gemini-3.5-flash-lite` there: a turn costs two
+requests (classify + phrase), so the default model's 20/day is under one
+journey, and each model has its own bucket.
 
 Smoke-tested on 2026-11-19 by building the image and running it against the
 local Postgres: refuses with no environment, then 401 / 401 / 200 / 200 / 429
