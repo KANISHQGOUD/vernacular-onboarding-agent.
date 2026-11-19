@@ -172,7 +172,7 @@ Branch `master`, tree clean.
 > below are not like that: they are wrong only when the code changes, which
 > is what makes them worth writing down.
 
-**1154 tests pass, ~7s.** 1132 need no network and no keys; 22 need Postgres.
+**1158 tests pass, ~7s.** 1136 need no network and no keys; 22 need Postgres.
 One more is skipped by default: the live Sarvam round trip, which runs only
 under `SARVAM_LIVE=1` because it spends prepaid credit.
 
@@ -319,6 +319,17 @@ moves faster than this file.
   a fresh bucket — that is why it is an env var.
 - Latency varies with congestion: 1.2s median on a good run, 3.4s on a bad
   one. Do not redesign on one measurement.
+- **Every call has a 10s deadline, and 10s is the floor.** The SDK's default
+  is no timeout at all: on 2026-11-19 one call sat ~130s and then returned
+  503 "high demand". The SDK forwards the timeout to Google as a server
+  deadline, and the API rejects anything under 10s with a 400 -- 8s passed
+  every offline test and broke every live call. `MODEL_TIMEOUT_MS`; a timeout
+  or dropped connection is an `httpx` error, not `APIError`, and is caught as
+  `ModelUnavailableError` so the caller hears "that's not you".
+- **The free tier is not reliable enough to demo on.** The same afternoon:
+  one call fine, then 503, then two 504s at the 10s deadline. The app
+  degraded correctly every time, but a conversation cannot progress through
+  it. Paid tier, or a fallback model, before anyone else is shown this.
 - Structured output is strong: a date spoken entirely in Hindi words
   ("ek janvari unnees sau nabbe") extracted as `1990-01-01`, no date parser.
 
@@ -382,6 +393,11 @@ Verified defaults: **`bulbul:v3`**, **`saaras:v4`**, speaker **`ritu`**. Since
 v2 is gone, TTS really costs ₹30/10K chars, not the ₹15 the pricing page lists
 for v2 — so ₹100 is roughly 33K characters, call it 6–10 conversations rather
 than 12–20.
+
+**The SDK's defaults would hold a caller for minutes.** sarvamai 0.1.31
+defaults to a 60s timeout and `max_retries=2` with backoff. Every call now
+passes `REQUEST_OPTIONS` (15s, no retries); both failure paths already degrade,
+so waiting only lengthens the silence.
 
 **Sarvam spells Odia `od-IN`.** ISO 639-1, and this project, say `or-IN`. The
 mapping lives in the adapter, not in `languages.py`: one vendor's spelling is

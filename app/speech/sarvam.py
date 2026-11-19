@@ -88,6 +88,26 @@ def from_vendor(code: str | None) -> str | None:
     return FROM_SARVAM.get(code, code)
 
 
+# Per call: no hidden retries, and a ceiling on how long the vendor may take.
+#
+# The SDK's defaults, measured on 2026-11-19 in sarvamai 0.1.31: a 60-second
+# timeout and max_retries=2, with backoff. A failing call could therefore hold
+# a caller in silence for about three minutes before the page heard anything.
+# Both failure paths here already degrade -- synthesis falls back to the
+# browser's voice, transcription asks them to say it again -- so the only
+# thing waiting buys is a longer silence. Same argument, and the same fix, as
+# MODEL_TIMEOUT_MS in app/llm/client.py.
+#
+# 15s, not 8: synthesis measured 1.6s for one sentence, but transcription
+# uploads up to DEFAULT_PATIENCE_MS of audio first, and an upload on a slow
+# line should not be cut off mid-sentence.
+SPEECH_TIMEOUT_SECONDS = 15
+REQUEST_OPTIONS: dict[str, Any] = {
+    "timeout_in_seconds": SPEECH_TIMEOUT_SECONDS,
+    "max_retries": 0,
+}
+
+
 @dataclass
 class SarvamSpeech:
     """Satisfies `SpeechProvider`. One vendor, two methods, no decisions.
@@ -119,7 +139,9 @@ class SarvamSpeech:
         if self._client is None:
             from sarvamai import SarvamAI
 
-            self._client = SarvamAI(api_subscription_key=self.api_key)
+            self._client = SarvamAI(
+                api_subscription_key=self.api_key, timeout=SPEECH_TIMEOUT_SECONDS
+            )
         return self._client
 
     # -- Speech in ----------------------------------------------------------
@@ -137,6 +159,7 @@ class SarvamSpeech:
             "file": ("audio", audio.data, bare_media_type(audio.media_type)),
             "model": self.stt_model,
             "language_code": to_vendor(language),
+            "request_options": REQUEST_OPTIONS,
         }
         if expect is Expectation.CODE_MIXED:
             kwargs["mode"] = "codemix"
@@ -166,6 +189,7 @@ class SarvamSpeech:
                 target_language_code=to_vendor(language),
                 speaker=self.speaker,
                 model=self.tts_model,
+                request_options=REQUEST_OPTIONS,
             )
         except TypeError:
             # Older SDKs name it `language_code`. Both spellings have shipped.
@@ -174,6 +198,7 @@ class SarvamSpeech:
                 language_code=to_vendor(language),
                 speaker=self.speaker,
                 model=self.tts_model,
+                request_options=REQUEST_OPTIONS,
             )
         except Exception as exc:  # noqa: BLE001
             raise SpeechError(f"sarvam synthesis failed: {exc}") from exc

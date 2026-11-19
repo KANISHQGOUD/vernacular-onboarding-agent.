@@ -73,6 +73,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 from google import genai
 from google.genai import errors, types
 
@@ -94,6 +95,32 @@ DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 # Both jobs -- classifying an utterance and phrasing one sentence -- are short
 # and latency-critical on a voice call. Neither needs deep reasoning; the
 # reasoning already happened, deterministically, in the state machine.
+# How long one model call may take before we give up and say so.
+#
+# The SDK's default is NO timeout. Measured on 2026-11-19 against the live
+# API: under load, gemini-3.5-flash held a request open for about 130 seconds
+# and then answered 503 "high demand". On a voice call that is two minutes of
+# silence followed by an apology -- the caller has hung up long before it.
+# Same trap as libpq's default; see CONNECT_TIMEOUT_SECONDS in postgres.py.
+#
+# 10s, and it cannot be lower. The SDK forwards this to Google as a server
+# deadline, and the API rejects anything under 10s with 400 INVALID_ARGUMENT
+# ("Minimum allowed deadline is 10s") -- found by setting 8s, which passed
+# every offline test and broke every live call. That is still about three
+# times the slowest healthy median measured (3.4s). A turn makes at most two
+# calls -- classify, then phrase -- so a caller's worst wait is ~20s rather
+# than unbounded.
+MODEL_TIMEOUT_MS = 10_000
+
+# One attempt, stated rather than inherited. The SDK does not retry by
+# default today, but a default is a thing that changes in a minor release, and
+# a retry hidden inside the client would silently multiply MODEL_TIMEOUT_MS.
+# Retrying belongs to the caller ("say that again"), never to the transport.
+_HTTP_OPTIONS = types.HttpOptions(
+    timeout=MODEL_TIMEOUT_MS,
+    retry_options=types.HttpRetryOptions(attempts=1),
+)
+
 CLASSIFY_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)
 PHRASING_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)
 
@@ -155,10 +182,15 @@ class LlmClient:
 
     api_key: str | None = None
     model: str = DEFAULT_MODEL
+    # Injectable so a test can point the client at a socket that never answers
+    # and prove the timeout holds, without spending a request.
+    http_options: types.HttpOptions = field(default_factory=lambda: _HTTP_OPTIONS)
     _client: genai.Client = field(init=False)
 
     def __post_init__(self) -> None:
-        self._client = genai.Client(api_key=load_api_key(self.api_key))
+        self._client = genai.Client(
+            api_key=load_api_key(self.api_key), http_options=self.http_options
+        )
 
     # -- The classifier's call: one constrained object ----------------------
 
@@ -199,7 +231,12 @@ class LlmClient:
                     max_output_tokens=1024,
                 ),
             )
-        except errors.APIError as exc:  # noqa: PERF203 - see below
+        except (errors.APIError, httpx.TransportError) as exc:  # noqa: PERF203 - see below
+            # TransportError covers the timeout above and a dropped connection.
+            # Neither is an APIError, so before this they escaped as a generic
+            # exception and the caller got "something went wrong" instead of
+            # the honest "that's not you".
+            #
             # 429 lands here and is ORDINARY on a 5-RPM free tier, not
             # exceptional. Deliberately not retried: the API's own retry-after
             # is tens of seconds, and a caller mid-sentence will not wait.
@@ -258,7 +295,7 @@ class LlmClient:
                     max_output_tokens=max_output_tokens,
                 ),
             )
-        except errors.APIError as exc:
+        except (errors.APIError, httpx.TransportError) as exc:
             log.warning("phrasing call failed: %s", exc)
             return None
 

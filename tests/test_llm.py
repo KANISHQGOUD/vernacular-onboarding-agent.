@@ -380,3 +380,84 @@ def test_the_amount_slot_cannot_smuggle_a_field_value():
     # only state that ever writes it -- see `_record_after_moving`.
     assert reading.field == "full_name"
 
+
+
+# ---------------------------------------------------------------------------
+# A model that never answers. Measured live: under load the API held a request
+# for ~130s and then said 503. The SDK's default timeout is none at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def silent_server():
+    """A real socket that accepts connections and never says anything."""
+    import socket
+    import threading
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    held: list = []
+    stop = threading.Event()
+
+    def accept_and_hold():
+        listener.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+                held.append(conn)
+            except OSError:
+                continue
+
+    thread = threading.Thread(target=accept_and_hold, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{listener.getsockname()[1]}"
+    stop.set()
+    thread.join(timeout=2)
+    for conn in held:
+        conn.close()
+    listener.close()
+
+
+def _client_against(url: str, timeout_ms: int = 500):
+    from app.llm.client import LlmClient
+
+    return LlmClient(
+        api_key="not-a-real-key",
+        http_options=types.HttpOptions(
+            base_url=url,
+            timeout=timeout_ms,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+
+
+def test_a_model_that_never_answers_is_given_up_on(silent_server):
+    """Raised as ModelUnavailableError -- the 'that's not you' path -- and
+    quickly. Before, a timeout was not an APIError, so it would have escaped
+    as a generic exception even once a timeout existed."""
+    import time
+
+    from app.llm.client import ModelUnavailableError
+
+    client = _client_against(silent_server)
+    started = time.monotonic()
+    with pytest.raises(ModelUnavailableError):
+        client.extract(system_instruction="s", prompt="p", schema={"type": "object"})
+    assert time.monotonic() - started < 5
+
+
+def test_phrasing_against_a_silent_model_falls_back(silent_server):
+    client = _client_against(silent_server)
+    assert client.say(system_instruction="s", instruction="i") is None
+
+
+def test_the_production_client_has_a_timeout_and_no_hidden_retries():
+    from app.llm.client import MODEL_TIMEOUT_MS, LlmClient
+
+    options = LlmClient(api_key="not-a-real-key")._client._api_client._http_options
+    assert options.timeout == MODEL_TIMEOUT_MS
+    # The API's floor: below 10s every live call is a 400. The offline suite
+    # cannot see that rejection, so the number itself is pinned.
+    assert 10_000 <= MODEL_TIMEOUT_MS <= 15_000
+    assert options.retry_options.attempts == 1

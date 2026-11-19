@@ -12,3 +12,6 @@ uvicorn[standard]==0.52.4
 psycopg[binary,pool]==3.3.4
 psycopg-pool==3.3.1
 sarvamai==0.1.31
+# Imported directly by app/llm/client.py to catch timeouts and dropped
+# connections, which the Gemini SDK raises as httpx errors, not APIError.
+httpx==0.28.1

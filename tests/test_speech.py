@@ -579,3 +579,24 @@ def test_the_cache_passes_the_expectation_through():
 
     cache.transcribe(Audio(b"x", "audio/wav"), "hi-IN", Expectation.CODE_MIXED)
     assert inner.expected == [Expectation.CODE_MIXED]
+
+
+def test_every_sarvam_call_is_bounded_and_never_retried_silently():
+    """The SDK defaults to a 60s timeout and two retries with backoff: about
+    three minutes of silence on a failing call. Every failure path here
+    already degrades, so waiting only lengthens the silence."""
+    from app.speech.sarvam import REQUEST_OPTIONS, SPEECH_TIMEOUT_SECONDS
+
+    provider = fake_sarvam()
+    provider.synthesize("namaste", "hi-IN")
+    assert provider._client.text_to_speech.calls[-1]["request_options"] == REQUEST_OPTIONS
+
+    seen = {}
+    provider._client.speech_to_text = type(
+        "STT", (), {"transcribe": lambda self, **kw: seen.update(kw) or type("R", (), {"transcript": "x"})()}
+    )()
+    provider.transcribe(Audio(data=b"x", media_type="audio/webm"), "hi-IN")
+    assert seen["request_options"] == REQUEST_OPTIONS
+
+    assert REQUEST_OPTIONS["max_retries"] == 0
+    assert REQUEST_OPTIONS["timeout_in_seconds"] == SPEECH_TIMEOUT_SECONDS <= 20
