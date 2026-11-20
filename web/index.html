@@ -31,6 +31,15 @@
   }
   #demo-notice strong { color: var(--accent); }
 
+  #code-gate {
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px;
+  }
+  #code-gate[hidden] { display: none; }
+  #code-gate input { flex: 0 1 260px; }
+  #code-gate button { padding: 10px 18px; }
+  #code-error { color: var(--accent); width: 100%; }
+
   main { flex: 1; display: grid; grid-template-columns: 1fr 300px; min-height: 0; }
   @media (max-width: 760px) { main { grid-template-columns: 1fr; } #side { display: none; } }
 
@@ -89,6 +98,16 @@
   of birth or phone number &mdash; make some up. What you say is sent to Google
   (speech recognition and Gemini) and, for the Indian-language voice, to Sarvam AI.
 </div>
+
+<!-- Asked for in the page, never with window.prompt(): in-app browsers --
+     the ones a link tapped in WhatsApp or Instagram opens in -- and embedded
+     browsers block prompt() outright, and the page then never connects. -->
+<form id="code-gate" hidden>
+  <label for="code-input">This demo needs the access code that came with your link:</label>
+  <input id="code-input" type="password" autocomplete="off" placeholder="access code" required>
+  <button type="submit">Start</button>
+  <span id="code-error" hidden>That code didn't work. Check it and try again.</span>
+</form>
 
 <main>
   <div id="chat"></div>
@@ -1017,6 +1036,24 @@ function accessCode() {
   try { return sessionStorage.getItem("accessCode") || ""; } catch { return ""; }
 }
 
+const codeGate = document.getElementById("code-gate");
+const codeInput = document.getElementById("code-input");
+const codeError = document.getElementById("code-error");
+
+function askForCode(previousWasWrong) {
+  codeGate.hidden = false;
+  codeError.hidden = !previousWasWrong;
+  codeInput.value = "";
+  codeInput.focus();
+  return new Promise(resolve => {
+    codeGate.onsubmit = (event) => {
+      event.preventDefault();
+      const value = codeInput.value.trim();
+      if (value) resolve(value);
+    };
+  });
+}
+
 async function start() {
   let code = accessCode();
   let response = await fetch("/api/session", {
@@ -1024,15 +1061,20 @@ async function start() {
     headers: code ? { "X-Access-Code": code } : {},
   });
 
-  if (response.status === 401) {
-    code = (window.prompt("This demo needs an access code. It came with the link you were sent.") || "").trim();
-    if (code) {
-      response = await fetch("/api/session", {
-        method: "POST",
-        headers: { "X-Access-Code": code },
-      });
-    }
+  // Ask in the page until a code works. Only a 401 means "wrong code"; any
+  // other answer (429, a 5xx) falls through to the message below, because
+  // asking again for a code would not fix it.
+  let wrong = false;
+  while (response.status === 401) {
+    setLive(false, "waiting for code");
+    code = await askForCode(wrong);
+    response = await fetch("/api/session", {
+      method: "POST",
+      headers: { "X-Access-Code": code },
+    });
+    wrong = true;
   }
+  codeGate.hidden = true;
 
   if (!response.ok) {
     const reason = await response.json().then(b => b.error).catch(() => "");

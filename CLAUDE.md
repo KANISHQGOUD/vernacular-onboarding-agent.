@@ -172,7 +172,7 @@ Branch `master`, tree clean.
 > below are not like that: they are wrong only when the code changes, which
 > is what makes them worth writing down.
 
-**1159 tests pass, ~7s.** 1137 need no network and no keys; 22 need Postgres.
+**1160 tests pass, ~7s.** 1138 need no network and no keys; 22 need Postgres.
 One more is skipped by default: the live Sarvam round trip, which runs only
 under `SARVAM_LIVE=1` because it spends prepaid credit.
 
@@ -283,6 +283,27 @@ journey, and each model has its own bucket.
 Smoke-tested on 2026-11-19 by building the image and running it against the
 local Postgres: refuses with no environment, then 401 / 401 / 200 / 200 / 429
 for no code, wrong code and a cap of 2.
+
+**Live since 2026-11-19:**
+https://vernacular-onboarding-agent-production.up.railway.app -- project
+`sparkling-expression`, deploying `main`. Railway's GitHub App is not
+installed, so a push does **not** redeploy: press Deploy in the dashboard.
+Variables there: `ACCESS_CODE`, `GOOGLE_API_KEY`, `SARVAM_API_KEY` (pasted by
+hand, never by an agent), `DATABASE_URL=${{Postgres.DATABASE_URL}}`,
+`MAX_SESSIONS_PER_DAY=5`, `GEMINI_MODEL=gemini-3.5-flash-lite`,
+`SARVAM_TTS=1`, `SARVAM_STT=1`, `PORT=8000` (the domain targets 8000).
+
+- **`SARVAM_STT=1` is what makes speaking work.** With Chrome's own
+  recogniser the microphone records and nothing comes back, and the page
+  repeats "didn't catch that" at somebody who is speaking clearly. Confirmed
+  by a real speaker on 2026-11-20. The cost is the consent gate's confidence
+  floor, which Sarvam cannot feed -- still the top open item.
+- **Never `window.prompt()`.** The access code was first asked for with one;
+  the desktop app's embedded browser and the in-app browsers that WhatsApp
+  and Instagram links open in block it, the page never connected, and it
+  looked exactly like a dead microphone. It is a form in the page now.
+- The desktop app's Browser pane blocks microphones outright. Test voice in
+  real Chrome; `localhost` counts as a secure context there.
 
 ## This machine — these cost time to find
 

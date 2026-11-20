@@ -764,3 +764,19 @@ def test_the_page_says_it_is_a_demo_before_anyone_speaks():
         assert vendor in notice
     # Before the conversation, not buried under it.
     assert page.index('id="demo-notice"') < page.index('id="chat"')
+
+
+def test_the_access_code_is_asked_for_in_the_page_not_a_pop_up():
+    """window.prompt() is blocked by embedded browsers and by the in-app
+    browsers a link tapped in WhatsApp or Instagram opens in -- and when it
+    throws, the page never connects and the Speak button stays disabled.
+    Found on the live deployment, where it looked like a dead microphone."""
+    client, _ = build_client()
+    page = client.get("/").text
+
+    import re
+
+    # A call with a message argument; the comment explaining why is fine.
+    assert re.search(r"prompt\(\s*[\"'`]", page) is None
+    assert 'id="code-gate"' in page
+    assert page.index('id="code-gate"') < page.index('id="chat"')
